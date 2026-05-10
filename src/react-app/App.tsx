@@ -1,65 +1,41 @@
-// src/App.tsx
-
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import viteLogo from "/vite.svg";
-import cloudflareLogo from "./assets/Cloudflare_Logo.svg";
-import honoLogo from "./assets/hono.svg";
-import "./App.css";
+import { useEffect } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { Landing } from "./routes/Landing";
+import { Login } from "./routes/Login";
+import { Dashboard } from "./routes/Dashboard";
+import { NewProject } from "./routes/NewProject";
+import { Workspace } from "./routes/Workspace";
+import { Billing } from "./routes/Billing";
+import { Heal } from "./routes/Heal";
+import { Account } from "./routes/Account";
+import { AppLayout } from "./components/AppLayout";
+import { api } from "./lib/api";
+import { useAuth } from "./stores/auth";
 
 function App() {
-	const [count, setCount] = useState(0);
-	const [name, setName] = useState("unknown");
+	const { setUser, setLoading } = useAuth();
+	const me = useQuery({ queryKey: ["me"], queryFn: api.me, staleTime: 60_000 });
+
+	useEffect(() => {
+		setLoading(me.isLoading);
+		if (me.data) setUser(me.data.user);
+	}, [me.data, me.isLoading, setUser, setLoading]);
 
 	return (
-		<>
-			<div>
-				<a href="https://vite.dev" target="_blank">
-					<img src={viteLogo} className="logo" alt="Vite logo" />
-				</a>
-				<a href="https://react.dev" target="_blank">
-					<img src={reactLogo} className="logo react" alt="React logo" />
-				</a>
-				<a href="https://hono.dev/" target="_blank">
-					<img src={honoLogo} className="logo cloudflare" alt="Hono logo" />
-				</a>
-				<a href="https://workers.cloudflare.com/" target="_blank">
-					<img
-						src={cloudflareLogo}
-						className="logo cloudflare"
-						alt="Cloudflare logo"
-					/>
-				</a>
-			</div>
-			<h1>Vite + React + Hono + Cloudflare</h1>
-			<div className="card">
-				<button
-					onClick={() => setCount((count) => count + 1)}
-					aria-label="increment"
-				>
-					count is {count}
-				</button>
-				<p>
-					Edit <code>src/App.tsx</code> and save to test HMR
-				</p>
-			</div>
-			<div className="card">
-				<button
-					onClick={() => {
-						fetch("/api/")
-							.then((res) => res.json() as Promise<{ name: string }>)
-							.then((data) => setName(data.name));
-					}}
-					aria-label="get name"
-				>
-					Name from API is: {name}
-				</button>
-				<p>
-					Edit <code>worker/index.ts</code> to change the name
-				</p>
-			</div>
-			<p className="read-the-docs">Click on the logos to learn more</p>
-		</>
+		<Routes>
+			<Route path="/" element={<Landing />} />
+			<Route path="/login" element={<Login />} />
+			<Route element={<AppLayout />}>
+				<Route path="/dashboard" element={<Dashboard />} />
+				<Route path="/new" element={<NewProject />} />
+				<Route path="/p/:slug" element={<Workspace />} />
+				<Route path="/billing" element={<Billing />} />
+				<Route path="/heal" element={<Heal />} />
+				<Route path="/account" element={<Account />} />
+			</Route>
+			<Route path="*" element={<Navigate to="/" replace />} />
+		</Routes>
 	);
 }
 

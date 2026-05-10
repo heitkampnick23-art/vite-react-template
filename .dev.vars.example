@@ -1,0 +1,21 @@
+# Copy to .dev.vars (gitignored) for `wrangler dev`. Production secrets go via `wrangler secret put`.
+
+JWT_SECRET=replace-with-32-random-bytes-base64
+SECRETS_MASTER_KEY=replace-with-base64-32-random-bytes
+
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+GOOGLE_AI_KEY=AIza...
+
+RESEND_KEY=re_...
+
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+GOOGLE_OAUTH_ID=
+GOOGLE_OAUTH_SECRET=
+
+STRIPE_SECRET=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+APP_URL=http://localhost:5173
+APP_NAME=Generate AI
