@@ -10,53 +10,26 @@
 		"directory": "./dist/client",
 		"not_found_handling": "single-page-application"
 	},
-	"routes": [
-		{ "pattern": "generateai.build", "custom_domain": true },
-		{ "pattern": "www.generateai.build", "custom_domain": true }
-	],
 	"d1_databases": [
 		{
 			"binding": "DB",
 			"database_name": "generate-ai",
-			"database_id": "REPLACE_WITH_D1_ID",
+			"database_id": "28ffd451-58bb-4f95-95b6-04dc64039407",
 			"migrations_dir": "migrations"
 		}
 	],
 	"kv_namespaces": [
-		{ "binding": "SESSIONS", "id": "REPLACE_WITH_KV_SESSIONS_ID" },
-		{ "binding": "CACHE", "id": "REPLACE_WITH_KV_CACHE_ID" }
+		{ "binding": "SESSIONS", "id": "3c828e0a27ed4a6789def59cd2144e77" },
+		{ "binding": "CACHE", "id": "509e8a2e42f645eab89aaf61983cb960" }
 	],
 	"r2_buckets": [
 		{ "binding": "FILES", "bucket_name": "generate-ai-files" },
 		{ "binding": "BUILDS", "bucket_name": "generate-ai-builds" },
 		{ "binding": "LOGS", "bucket_name": "generate-ai-logs" }
 	],
-	"queues": {
-		"producers": [
-			{ "binding": "JOBS", "queue": "generate-ai-jobs" },
-			{ "binding": "HEAL", "queue": "generate-ai-heal" }
-		],
-		"consumers": [
-			{ "queue": "generate-ai-jobs", "max_batch_size": 10, "max_batch_timeout": 5 },
-			{ "queue": "generate-ai-heal", "max_batch_size": 5, "max_batch_timeout": 10 }
-		]
-	},
-	"durable_objects": {
-		"bindings": [
-			{ "name": "COUNCIL", "class_name": "CouncilRoom" },
-			{ "name": "LIVEDOC", "class_name": "LiveDoc" },
-			{ "name": "SANDBOX", "class_name": "SandboxSession" }
-		]
-	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": ["CouncilRoom", "LiveDoc", "SandboxSession"]
-		}
-	],
 	"ai": { "binding": "AI" },
 	"vars": {
-		"APP_URL": "https://generateai.build",
+		"APP_URL": "https://generate-ai.sumhead.workers.dev",
 		"APP_NAME": "Generate AI"
 	}
 }

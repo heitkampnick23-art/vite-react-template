@@ -7,13 +7,14 @@ import { logger } from "hono/logger";
 import auth from "./routes/auth";
 import projects from "./routes/projects";
 import ai from "./routes/ai";
-import council from "./routes/council";
 import billing from "./routes/billing";
 import webhooks from "./routes/webhooks";
-import deploy from "./routes/deploy";
-import heal from "./routes/heal";
 import templates from "./routes/templates";
 import secrets from "./routes/secrets";
+// Disabled until Queues + DO bindings are provisioned:
+// import council from "./routes/council";
+// import deploy from "./routes/deploy";
+// import heal from "./routes/heal";
 import type { AppEnv } from "./middleware/auth";
 
 const app = new Hono<AppEnv>();
@@ -40,13 +41,14 @@ app.route("/api/auth", auth);
 app.route("/auth", auth); // also at /auth for redirect-based flows
 app.route("/api/projects", projects);
 app.route("/api/ai", ai);
-app.route("/api/council", council);
 app.route("/api/billing", billing);
-app.route("/api/deploy", deploy);
-app.route("/api/heal", heal);
 app.route("/api/templates", templates);
 app.route("/api/secrets", secrets);
 app.route("/api/webhooks", webhooks);
+// Disabled until Queues + DO bindings are provisioned:
+// app.route("/api/council", council);
+// app.route("/api/deploy", deploy);
+// app.route("/api/heal", heal);
 
 app.onError((err, c) => {
 	console.error("worker error", err);
