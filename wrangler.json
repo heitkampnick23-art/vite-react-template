@@ -42,6 +42,19 @@
 		]
 	},
 	"ai": { "binding": "AI" },
+	"durable_objects": {
+		"bindings": [
+			{ "name": "COUNCIL", "class_name": "CouncilRoom" },
+			{ "name": "LIVEDOC", "class_name": "LiveDoc" },
+			{ "name": "SANDBOX", "class_name": "SandboxSession" }
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["CouncilRoom", "LiveDoc", "SandboxSession"]
+		}
+	],
 	"vars": {
 		"APP_URL": "https://generateai.build",
 		"APP_NAME": "Generate AI"
