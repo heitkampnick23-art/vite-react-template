@@ -10,10 +10,6 @@
 		"directory": "./dist/client",
 		"not_found_handling": "single-page-application"
 	},
-	"routes": [
-		{ "pattern": "generateai.build", "custom_domain": true },
-		{ "pattern": "www.generateai.build", "custom_domain": true }
-	],
 	"d1_databases": [
 		{
 			"binding": "DB",
@@ -30,29 +26,6 @@
 		{ "binding": "FILES", "bucket_name": "generate-ai-files" },
 		{ "binding": "BUILDS", "bucket_name": "generate-ai-builds" },
 		{ "binding": "LOGS", "bucket_name": "generate-ai-logs" }
-	],
-	"queues": {
-		"producers": [
-			{ "binding": "JOBS", "queue": "generate-ai-jobs" },
-			{ "binding": "HEAL", "queue": "generate-ai-heal" }
-		],
-		"consumers": [
-			{ "queue": "generate-ai-jobs", "max_batch_size": 10, "max_batch_timeout": 5 },
-			{ "queue": "generate-ai-heal", "max_batch_size": 5, "max_batch_timeout": 10 }
-		]
-	},
-	"durable_objects": {
-		"bindings": [
-			{ "name": "COUNCIL", "class_name": "CouncilRoom" },
-			{ "name": "LIVEDOC", "class_name": "LiveDoc" },
-			{ "name": "SANDBOX", "class_name": "SandboxSession" }
-		]
-	},
-	"migrations": [
-		{
-			"tag": "v1",
-			"new_sqlite_classes": ["CouncilRoom", "LiveDoc", "SandboxSession"]
-		}
 	],
 	"ai": { "binding": "AI" },
 	"vars": {
