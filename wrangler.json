@@ -52,7 +52,7 @@
 	"migrations": [
 		{
 			"tag": "v1",
-			"new_sqlite_classes": ["CouncilRoom", "LiveDoc", "SandboxSession"]
+			"new_classes": ["CouncilRoom", "LiveDoc", "SandboxSession"]
 		}
 	],
 	"vars": {
