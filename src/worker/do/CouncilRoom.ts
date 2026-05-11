@@ -11,6 +11,7 @@ type StartPayload = { runId: string; prompt: string; userId: string; projectId?:
 
 export class CouncilRoom extends DurableObject<Env> {
 	subscribers: Set<WritableStreamDefaultWriter> = new Set();
+	transcript: unknown[] = [];
 	state: { status: "idle" | "running" | "done" | "error"; runId?: string } = { status: "idle" };
 
 	async fetch(req: Request): Promise<Response> {
@@ -18,13 +19,31 @@ export class CouncilRoom extends DurableObject<Env> {
 		if (url.pathname === "/start" && req.method === "POST") {
 			const payload = (await req.json()) as StartPayload;
 			this.state = { status: "running", runId: payload.runId };
+			this.transcript = [];
 			this.ctx.waitUntil(this.runDeliberation(payload));
 			return new Response("started");
 		}
 		if (url.pathname === "/stream") {
+			const enc = new TextEncoder();
 			const { readable, writable } = new TransformStream();
 			const writer = writable.getWriter();
-			this.subscribers.add(writer);
+			// Replay buffered events so late subscribers don't miss earlier turns.
+			for (const ev of this.transcript) {
+				try {
+					await writer.write(enc.encode(`data: ${JSON.stringify(ev)}\n\n`));
+				} catch {
+					/* writer closed mid-replay */
+				}
+			}
+			if (this.state.status === "done" || this.state.status === "error") {
+				try {
+					await writer.close();
+				} catch {
+					/* noop */
+				}
+			} else {
+				this.subscribers.add(writer);
+			}
 			return new Response(readable, {
 				headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
 			});
@@ -33,6 +52,7 @@ export class CouncilRoom extends DurableObject<Env> {
 	}
 
 	async broadcast(obj: unknown) {
+		this.transcript.push(obj);
 		const enc = new TextEncoder();
 		const chunk = enc.encode(`data: ${JSON.stringify(obj)}\n\n`);
 		const dead: WritableStreamDefaultWriter[] = [];
@@ -140,6 +160,7 @@ export class CouncilRoom extends DurableObject<Env> {
 				.bind(synth.text, totalTokens, Date.now(), p.runId)
 				.run();
 			await this.broadcast({ type: "done", finalPlan: synth.text, tokensUsed: totalTokens });
+			this.state = { status: "done", runId: p.runId };
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			await this.env.DB
@@ -147,6 +168,7 @@ export class CouncilRoom extends DurableObject<Env> {
 				.bind(Date.now(), p.runId)
 				.run();
 			await this.broadcast({ type: "error", message: msg });
+			this.state = { status: "error", runId: p.runId };
 		} finally {
 			for (const w of this.subscribers) {
 				try {

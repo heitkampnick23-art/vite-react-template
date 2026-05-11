@@ -18,8 +18,9 @@ export async function streamClaude(args: {
 	messages: Msg[];
 	maxTokens?: number;
 	requestId: string;
+	apiKey?: string;
 }): Promise<ReadableStream<Uint8Array>> {
-	const client = new Anthropic({ apiKey: args.env.ANTHROPIC_API_KEY });
+	const client = new Anthropic({ apiKey: args.apiKey ?? args.env.ANTHROPIC_API_KEY });
 	const modelMap: Record<string, string> = {
 		"claude-sonnet-4-6": "claude-sonnet-4-6",
 		"claude-opus-4-7": "claude-opus-4-7",
