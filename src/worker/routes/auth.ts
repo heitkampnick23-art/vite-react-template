@@ -132,7 +132,73 @@ auth.post("/logout", requireUser, async (c) => {
 	return c.json({ ok: true });
 });
 
-// GitHub & Google OAuth — stubs that redirect to provider; full Arctic implementation in Phase 2.
+auth.get("/google", (c) => {
+	const clientId = c.env.GOOGLE_OAUTH_ID;
+	const state = nanoid(24);
+	c.executionCtx.waitUntil(
+		c.env.DB
+			.prepare("INSERT INTO oauth_states (state, provider, expires_at) VALUES (?,?,?)")
+			.bind(state, "google", Date.now() + 600_000)
+			.run(),
+	);
+	const redirect = `${c.env.APP_URL}/auth/google/callback`;
+	const url =
+		`https://accounts.google.com/o/oauth2/v2/auth?` +
+		new URLSearchParams({
+			client_id: clientId,
+			redirect_uri: redirect,
+			response_type: "code",
+			scope: "openid email profile",
+			state,
+			access_type: "online",
+			prompt: "select_account",
+		}).toString();
+	return c.redirect(url);
+});
+
+auth.get("/google/callback", async (c) => {
+	const code = c.req.query("code");
+	const state = c.req.query("state");
+	if (!code || !state) return c.redirect("/login?error=oauth");
+	const row = await c.env.DB
+		.prepare("SELECT * FROM oauth_states WHERE state = ? AND provider = 'google' AND expires_at > ?")
+		.bind(state, Date.now())
+		.first();
+	if (!row) return c.redirect("/login?error=oauth_state");
+	const redirect = `${c.env.APP_URL}/auth/google/callback`;
+	const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			client_id: c.env.GOOGLE_OAUTH_ID,
+			client_secret: c.env.GOOGLE_OAUTH_SECRET,
+			code,
+			grant_type: "authorization_code",
+			redirect_uri: redirect,
+		}).toString(),
+	}).then((r) => r.json() as Promise<{ access_token?: string }>);
+	if (!tokenRes.access_token) return c.redirect("/login?error=oauth_token");
+	const profile = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+		headers: { Authorization: `Bearer ${tokenRes.access_token}` },
+	}).then(
+		(r) =>
+			r.json() as Promise<{
+				id: string;
+				email: string;
+				verified_email?: boolean;
+				name?: string;
+				picture?: string;
+			}>,
+	);
+	if (!profile.email) return c.redirect("/login?error=no_email");
+	const user = await findOrCreateUser(c, profile.email, profile.name ?? null, {
+		googleId: profile.id,
+		avatar: profile.picture,
+	});
+	await createSession(c, user.id);
+	return c.redirect("/dashboard");
+});
+
 auth.get("/github", (c) => {
 	const clientId = c.env.GITHUB_CLIENT_ID;
 	const state = nanoid(24);
