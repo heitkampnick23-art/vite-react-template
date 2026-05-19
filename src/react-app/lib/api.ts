@@ -20,6 +20,10 @@ export const api = {
 	logout: () => req<{ ok: true }>("/api/auth/logout", { method: "POST" }),
 	sendMagic: (email: string) =>
 		req<{ ok: true; devUrl?: string }>("/api/auth/magic", { method: "POST", body: JSON.stringify({ email }) }),
+	signup: (body: { email: string; password: string; name?: string }) =>
+		req<{ user: UserPublic }>("/api/auth/signup", { method: "POST", body: JSON.stringify(body) }),
+	signin: (body: { email: string; password: string }) =>
+		req<{ user: UserPublic }>("/api/auth/signin", { method: "POST", body: JSON.stringify(body) }),
 	projects: () => req<{ projects: Project[] }>("/api/projects"),
 	createProject: (body: { name: string; template?: string; description?: string }) =>
 		req<{ project: Project }>("/api/projects", { method: "POST", body: JSON.stringify(body) }),

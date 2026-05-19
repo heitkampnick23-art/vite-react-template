@@ -135,7 +135,7 @@ export const PLANS: Record<Plan, {
 		displayName: "Pro",
 		monthlyCredits: 2_000_000,
 		priceCents: 2000,
-		stripePriceId: "price_pro_monthly",
+		stripePriceId: "price_1TVvlBQu1YpWmfU0T0BJoAwR",
 		features: [
 			"2M credits / month",
 			"Unlimited projects",
@@ -152,7 +152,7 @@ export const PLANS: Record<Plan, {
 		displayName: "Team",
 		monthlyCredits: 3_000_000,
 		priceCents: 6000,
-		stripePriceId: "price_team_monthly_per_seat",
+		stripePriceId: "price_1TVxDdQu1YpWmfU0a22w2Enk",
 		features: [
 			"3M credits / seat / month",
 			"Everything in Pro",
@@ -183,7 +183,7 @@ export const PLANS: Record<Plan, {
 };
 
 export const TOPUPS = [
-	{ id: "topup_small", credits: 500_000, priceCents: 500, stripePriceId: "price_topup_500k" },
-	{ id: "topup_medium", credits: 2_500_000, priceCents: 2000, stripePriceId: "price_topup_2_5m" },
-	{ id: "topup_large", credits: 10_000_000, priceCents: 7500, stripePriceId: "price_topup_10m" },
+	{ id: "topup_small", credits: 500_000, priceCents: 500, stripePriceId: "price_1TVxDjQu1YpWmfU0Ql70D49u" },
+	{ id: "topup_medium", credits: 2_500_000, priceCents: 2000, stripePriceId: "price_1TVxDpQu1YpWmfU0mB8vNG2G" },
+	{ id: "topup_large", credits: 10_000_000, priceCents: 7500, stripePriceId: "price_1TVxDvQu1YpWmfU048XouhTe" },
 ];

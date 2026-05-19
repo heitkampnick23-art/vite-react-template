@@ -36,6 +36,7 @@ export type UserRow = {
 	google_id: string | null;
 	plan: "free" | "pro" | "team" | "enterprise";
 	stripe_customer_id: string | null;
+	password_hash: string | null;
 	token_balance: number;
 	role: "user" | "admin";
 	created_at: number;
