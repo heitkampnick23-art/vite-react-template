@@ -9,7 +9,7 @@ export function Account() {
 			<div className="glass mt-6 space-y-4 rounded-2xl p-6 text-sm">
 				<Row label="Email" value={user.email} />
 				<Row label="Name" value={user.name ?? "—"} />
-				<Row label="Plan" value={user.plan} />
+				<Row label="Plan" value={user.plan === "free" ? "None — choose one in Billing" : user.plan} />
 				<Row label="Credits" value={user.tokenBalance.toLocaleString()} />
 				<Row label="Role" value={user.role} />
 			</div>

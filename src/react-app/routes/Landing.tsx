@@ -16,8 +16,8 @@ export function Landing() {
 				</nav>
 				<div className="flex items-center gap-3">
 					<Link to="/login" className="text-sm text-zinc-300 hover:text-white">Sign in</Link>
-					<Link to="/login">
-						<Button size="sm">Start Building</Button>
+					<Link to="/login?mode=signup">
+						<Button size="sm">Sign up</Button>
 					</Link>
 				</div>
 			</header>
@@ -35,16 +35,16 @@ export function Landing() {
 					<strong> Self-Healing deployments</strong>. Replit, Lovable, Manus — leveled up.
 				</p>
 				<div className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row">
-					<Link to="/login">
+					<Link to="/login?mode=signup">
 						<Button size="lg">
-							<Wand2 className="h-4 w-4" /> Start building free
+							<Wand2 className="h-4 w-4" /> Start building
 						</Button>
 					</Link>
 					<a href="#features">
 						<Button size="lg" variant="outline">See how it works</Button>
 					</a>
 				</div>
-				<p className="mt-4 text-xs text-zinc-500">100,000 credits free every month. No credit card.</p>
+				<p className="mt-4 text-xs text-zinc-500">Sign up in seconds with Google or your email, pick a plan, and ship today.</p>
 			</section>
 
 			<section id="features" className="mx-auto max-w-7xl px-6 py-16">
@@ -105,9 +105,9 @@ export function Landing() {
 				</div>
 			</section>
 
-			<section id="pricing" className="mx-auto max-w-7xl px-6 py-20">
+			<section id="pricing" className="mx-auto max-w-4xl px-6 py-20">
 				<h2 className="mb-12 text-center text-3xl font-bold md:text-4xl">Simple, credit-based pricing</h2>
-				<div className="grid gap-4 md:grid-cols-3">
+				<div className="grid gap-4 md:grid-cols-2">
 					{pricing.map((p) => (
 						<div key={p.name} className={"glass rounded-2xl p-6 " + (p.featured ? "ring-2 ring-brand-500/40" : "")}>
 							<div className="mb-3 text-sm text-zinc-400">{p.name}</div>
@@ -123,7 +123,7 @@ export function Landing() {
 									</li>
 								))}
 							</ul>
-							<Link to="/login" className="mt-6 block">
+							<Link to="/login?mode=signup" className="mt-6 block">
 								<Button className="w-full" variant={p.featured ? "primary" : "outline"}>
 									{p.cta}
 								</Button>
@@ -131,10 +131,18 @@ export function Landing() {
 						</div>
 					))}
 				</div>
+				<p className="mt-6 text-center text-xs text-zinc-500">
+					Need more? One-time credit top-ups are available from your billing page after you subscribe.
+				</p>
 			</section>
 
 			<footer className="border-t border-white/5 px-6 py-10 text-center text-xs text-zinc-500">
 				<Logo className="mb-4 justify-center" />
+				<div className="mb-2 flex items-center justify-center gap-4">
+					<Link to="/terms" className="hover:text-white">Terms</Link>
+					<Link to="/privacy" className="hover:text-white">Privacy</Link>
+					<Link to="/login" className="hover:text-white">Sign in</Link>
+				</div>
 				<div>© {new Date().getFullYear()} Generate AI · generateai.build</div>
 			</footer>
 		</div>
@@ -154,15 +162,6 @@ const features = [
 ];
 
 const pricing = [
-	{
-		name: "Free",
-		price: "$0",
-		suffix: "",
-		credits: "100,000",
-		features: ["3 active projects", "Claude Haiku + GPT-4o-mini", "Community templates", "Public deploys"],
-		cta: "Start free",
-		featured: false,
-	},
 	{
 		name: "Pro",
 		price: "$20",
@@ -190,7 +189,7 @@ const pricing = [
 			"Shared secrets vault",
 			"Priority support",
 		],
-		cta: "Start team trial",
+		cta: "Choose Team",
 		featured: false,
 	},
 ];

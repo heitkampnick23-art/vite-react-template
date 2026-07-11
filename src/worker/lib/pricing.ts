@@ -116,17 +116,15 @@ export const PLANS: Record<Plan, {
 	councilEnabled: boolean;
 	seats: number;
 }> = {
+	// Unpaid state — accounts start here with zero credits until they subscribe.
 	free: {
-		displayName: "Free",
-		monthlyCredits: 100_000,
+		displayName: "No plan",
+		monthlyCredits: 0,
 		priceCents: 0,
 		stripePriceId: null,
 		features: [
-			"100k credits / month",
-			"3 active projects",
-			"Claude Haiku & GPT-4o-mini",
-			"Community templates",
-			"Public deployments",
+			"Account & billing access only",
+			"Subscribe to Pro or Team to build",
 		],
 		councilEnabled: false,
 		seats: 1,

@@ -59,7 +59,7 @@ export { SandboxSession } from "./do/SandboxSession";
 
 export default {
 	fetch: app.fetch,
-	async queue(batch: MessageBatch, env: Env, _ctx: ExecutionContext) {
+	async queue(batch: MessageBatch, env: Env) {
 		for (const msg of batch.messages) {
 			try {
 				await handleJob(msg.body as JobMessage, env);
@@ -70,7 +70,7 @@ export default {
 			}
 		}
 	},
-	async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
+	async scheduled(_controller: ScheduledController, env: Env) {
 		// Hourly: expire old sessions, KV cache cleanup.
 		await env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(Date.now()).run();
 		await env.DB.prepare("DELETE FROM oauth_states WHERE expires_at < ?").bind(Date.now()).run();

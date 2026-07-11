@@ -94,7 +94,7 @@ async function createSession(c: Parameters<typeof auth.fetch>[0] extends never ?
 
 async function findOrCreateUser(c: import("hono").Context<AppEnv>, email: string, name?: string | null, opts?: { githubId?: string; googleId?: string; avatar?: string }) {
 	const existing = await getUserByEmail(c.env.DB, email);
-	if (existing) return existing;
+	if (existing) return { user: existing, created: false };
 	const id = "u_" + nanoid(16);
 	const now = Date.now();
 	const plan = "free" as const;
@@ -119,7 +119,7 @@ async function findOrCreateUser(c: import("hono").Context<AppEnv>, email: string
 		.run();
 	// Welcome ledger entry.
 	await credit(c.env.DB, { userId: id, amount: 0, reason: "signup_grant", requestId: nanoid() });
-	return (await getUserByEmail(c.env.DB, email))!;
+	return { user: (await getUserByEmail(c.env.DB, email))!, created: true };
 }
 
 // GET /auth/me
@@ -218,9 +218,9 @@ auth.get("/callback", async (c) => {
 		.prepare("UPDATE magic_links SET used = 1 WHERE token = ?")
 		.bind(token)
 		.run();
-	const user = await findOrCreateUser(c, row.email);
+	const { user, created } = await findOrCreateUser(c, row.email);
 	await createSession(c, user.id);
-	return c.redirect("/dashboard");
+	return c.redirect(created ? "/billing" : "/dashboard");
 });
 
 // POST /auth/logout
@@ -236,6 +236,7 @@ auth.post("/logout", requireUser, async (c) => {
 
 auth.get("/google", (c) => {
 	const clientId = c.env.GOOGLE_OAUTH_ID;
+	if (!clientId) return c.redirect("/login?error=oauth");
 	const state = nanoid(24);
 	c.executionCtx.waitUntil(
 		c.env.DB
@@ -293,16 +294,18 @@ auth.get("/google/callback", async (c) => {
 			}>,
 	);
 	if (!profile.email) return c.redirect("/login?error=no_email");
-	const user = await findOrCreateUser(c, profile.email, profile.name ?? null, {
+	if (profile.verified_email === false) return c.redirect("/login?error=unverified_email");
+	const { user, created } = await findOrCreateUser(c, profile.email, profile.name ?? null, {
 		googleId: profile.id,
 		avatar: profile.picture,
 	});
 	await createSession(c, user.id);
-	return c.redirect("/dashboard");
+	return c.redirect(created ? "/billing" : "/dashboard");
 });
 
 auth.get("/github", (c) => {
 	const clientId = c.env.GITHUB_CLIENT_ID;
+	if (!clientId) return c.redirect("/login?error=oauth");
 	const state = nanoid(24);
 	c.executionCtx.waitUntil(
 		c.env.DB
@@ -347,12 +350,12 @@ auth.get("/github/callback", async (c) => {
 		email = emails.find((e) => e.primary && e.verified)?.email ?? null;
 	}
 	if (!email) return c.redirect("/login?error=no_email");
-	const user = await findOrCreateUser(c, email, profile.name ?? profile.login, {
+	const { user, created } = await findOrCreateUser(c, email, profile.name ?? profile.login, {
 		githubId: String(profile.id),
 		avatar: profile.avatar_url,
 	});
 	await createSession(c, user.id);
-	return c.redirect("/dashboard");
+	return c.redirect(created ? "/billing" : "/dashboard");
 });
 
 export default auth;

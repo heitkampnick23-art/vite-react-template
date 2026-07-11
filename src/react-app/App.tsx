@@ -9,6 +9,7 @@ import { Workspace } from "./routes/Workspace";
 import { Billing } from "./routes/Billing";
 import { Heal } from "./routes/Heal";
 import { Account } from "./routes/Account";
+import { Terms, Privacy } from "./routes/Legal";
 import { AppLayout } from "./components/AppLayout";
 import { api } from "./lib/api";
 import { useAuth } from "./stores/auth";
@@ -26,6 +27,8 @@ function App() {
 		<Routes>
 			<Route path="/" element={<Landing />} />
 			<Route path="/login" element={<Login />} />
+			<Route path="/terms" element={<Terms />} />
+			<Route path="/privacy" element={<Privacy />} />
 			<Route element={<AppLayout />}>
 				<Route path="/dashboard" element={<Dashboard />} />
 				<Route path="/new" element={<NewProject />} />

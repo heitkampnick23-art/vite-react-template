@@ -1,6 +1,6 @@
 import { Link, NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useEffect } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Logo } from "./Logo";
 import { TokenMeter } from "./TokenMeter";
 import { api } from "../lib/api";
@@ -10,8 +10,9 @@ import { LayoutGrid, Settings, CreditCard, LogOut, Wand2, FlaskConical } from "l
 import { cn } from "../lib/cn";
 
 export function AppLayout() {
-	const { user, setUser } = useAuth();
+	const { user, loading, setUser } = useAuth();
 	const navigate = useNavigate();
+	const queryClient = useQueryClient();
 	const balance = useQuery({
 		queryKey: ["balance"],
 		queryFn: api.balance,
@@ -20,9 +21,16 @@ export function AppLayout() {
 	});
 
 	useEffect(() => {
-		if (!user) navigate("/login");
-	}, [user, navigate]);
+		if (!loading && !user) navigate("/login");
+	}, [user, loading, navigate]);
 
+	if (loading) {
+		return (
+			<div className="grid min-h-screen place-items-center text-sm text-zinc-500">
+				Loading…
+			</div>
+		);
+	}
 	if (!user) return null;
 
 	const nav = [
@@ -67,6 +75,8 @@ export function AppLayout() {
 						onClick={async () => {
 							await api.logout();
 							setUser(null);
+							queryClient.removeQueries({ queryKey: ["me"] });
+							queryClient.removeQueries({ queryKey: ["balance"] });
 							navigate("/login");
 						}}
 					>

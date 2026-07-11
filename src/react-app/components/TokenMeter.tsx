@@ -19,7 +19,7 @@ export function TokenMeter({ balance, plan, compact = false }: { balance: number
 				<>
 					<span className="text-zinc-500">credits</span>
 					<span className="ml-1 rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-300">
-						{plan}
+						{plan === "free" ? "no plan" : plan}
 					</span>
 				</>
 			)}
