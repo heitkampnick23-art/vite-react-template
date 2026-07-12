@@ -19,7 +19,7 @@ export function Billing() {
 	async function go(plan?: "pro" | "team", topupId?: string) {
 		try {
 			const { url } = await api.checkout({ plan, topupId });
-			window.location.href = url;
+			window.location.assign(url);
 		} catch (e) {
 			toast.error((e as Error).message);
 		}
@@ -28,16 +28,27 @@ export function Billing() {
 	async function portal() {
 		try {
 			const { url } = await api.portal();
-			window.location.href = url;
+			window.location.assign(url);
 		} catch (e) {
 			toast.error((e as Error).message);
 		}
 	}
 
+	const noPlan = balance.data && balance.data.plan === "free";
+
 	return (
 		<div className="mx-auto max-w-5xl p-6 lg:p-10">
 			<h1 className="text-2xl font-bold">Billing & credits</h1>
 			<p className="mt-1 text-sm text-zinc-400">All AI usage is metered. Hard cap at zero — no surprises.</p>
+
+			{noPlan && (
+				<div className="mt-6 rounded-2xl border border-brand-500/40 bg-brand-500/10 p-5 text-sm">
+					<div className="font-semibold">Choose a plan to start building</div>
+					<p className="mt-1 text-zinc-300">
+						Your account is set up. Pick Pro or Team below and your credits are available immediately.
+					</p>
+				</div>
+			)}
 
 			<div className="mt-6 grid gap-4 md:grid-cols-3">
 				<div className="glass rounded-2xl p-6 md:col-span-2">
@@ -47,7 +58,9 @@ export function Billing() {
 					<div className="mt-2 font-mono text-4xl tabular-nums">
 						{(balance.data?.balance ?? 0).toLocaleString()}
 					</div>
-					<div className="text-xs text-zinc-500">credits · {balance.data?.plan ?? "free"} plan</div>
+					<div className="text-xs text-zinc-500">
+						credits · {noPlan || !balance.data ? "no plan yet" : `${balance.data.plan} plan`}
+					</div>
 					<Button variant="outline" size="sm" onClick={portal} className="mt-4">
 						<CreditCard className="h-3.5 w-3.5" /> Manage subscription <ExternalLink className="h-3 w-3" />
 					</Button>
@@ -71,9 +84,9 @@ export function Billing() {
 			</div>
 
 			<h2 className="mt-10 text-lg font-semibold">Plans</h2>
-			<div className="mt-4 grid gap-4 md:grid-cols-3">
+			<div className="mt-4 grid gap-4 md:grid-cols-2">
 				{plans.data &&
-					(["free", "pro", "team"] as const).map((key) => {
+					(["pro", "team"] as const).map((key) => {
 						const p = plans.data!.plans[key];
 						return (
 							<div key={key} className="glass rounded-2xl p-6">
@@ -93,11 +106,13 @@ export function Billing() {
 										</li>
 									))}
 								</ul>
-								{key !== "free" && (
-									<Button onClick={() => go(key)} className="mt-5 w-full">
-										{balance.data?.plan === key ? "Current plan" : `Switch to ${p.displayName}`}
-									</Button>
-								)}
+								<Button
+									onClick={() => go(key)}
+									disabled={balance.data?.plan === key}
+									className="mt-5 w-full"
+								>
+									{balance.data?.plan === key ? "Current plan" : `Choose ${p.displayName}`}
+								</Button>
 							</div>
 						);
 					})}

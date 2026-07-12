@@ -1,0 +1,18 @@
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "mirrorclone",
+	"main": "./src/index.ts",
+	"compatibility_date": "2025-10-08",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": { "enabled": true },
+	"kv_namespaces": [
+		{
+			"binding": "MEMORY",
+			"id": "REPLACE_WITH_KV_ID_FROM_wrangler_kv_namespace_create"
+		}
+	],
+	"vars": {
+		"APP_NAME": "MirrorClone",
+		"PERSONA": "You are the digital twin of Nick. Speak casually and warmly, in short sentences suited to a phone call. Be helpful, a little playful, and decisive. If asked something you can't know, say you'll have the real Nick follow up."
+	}
+}
