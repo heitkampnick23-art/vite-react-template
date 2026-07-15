@@ -59,6 +59,7 @@
 	],
 	"vars": {
 		"APP_URL": "https://generateai.build",
-		"APP_NAME": "Generate AI"
+		"APP_NAME": "Generate AI",
+		"OWNER_EMAIL": "heitkampnick23@gmail.com"
 	}
 }

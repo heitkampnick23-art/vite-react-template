@@ -6,7 +6,7 @@ import { TokenMeter } from "./TokenMeter";
 import { api } from "../lib/api";
 import { useAuth } from "../stores/auth";
 import { Button } from "./ui/Button";
-import { LayoutGrid, Settings, CreditCard, LogOut, Wand2, FlaskConical } from "lucide-react";
+import { LayoutGrid, Settings, CreditCard, LogOut, Wand2, FlaskConical, Phone } from "lucide-react";
 import { cn } from "../lib/cn";
 
 export function AppLayout() {
@@ -37,6 +37,7 @@ export function AppLayout() {
 		{ to: "/dashboard", label: "Projects", icon: LayoutGrid },
 		{ to: "/new", label: "New Build", icon: Wand2 },
 		{ to: "/heal", label: "Self-Heal", icon: FlaskConical },
+		{ to: "/twin", label: "Phone Twin", icon: Phone },
 		{ to: "/billing", label: "Billing", icon: CreditCard },
 		{ to: "/account", label: "Account", icon: Settings },
 	];

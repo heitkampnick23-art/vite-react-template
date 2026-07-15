@@ -54,7 +54,37 @@ export const api = {
 	startCouncil: (prompt: string, projectId?: string) =>
 		req<{ runId: string }>("/api/council/start", { method: "POST", body: JSON.stringify({ prompt, projectId }) }),
 	healEvents: () => req<{ events: Array<{ id: string; error_signature: string; status: string; created_at: number }> }>("/api/heal/events"),
+	twinStatus: () => req<TwinStatus>("/api/twin/status"),
+	twinConnectTwilio: (body: { sid: string; token: string }) =>
+		req<{ ok: true; accountName: string; accountStatus: string; numbers: TwinOwnedNumber[] }>("/api/twin/twilio", {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	twinNumbers: () => req<{ numbers: TwinOwnedNumber[]; current: string | null }>("/api/twin/numbers"),
+	twinSearchNumbers: (area?: string) =>
+		req<{ numbers: Array<{ phoneNumber: string; name: string; locality: string; region: string }> }>(
+			`/api/twin/numbers/search${area ? `?area=${encodeURIComponent(area)}` : ""}`,
+		),
+	twinSetNumber: (body: { numberSid?: string; phoneNumber?: string }) =>
+		req<{ ok: true; number: string; purchased: boolean }>("/api/twin/number", { method: "POST", body: JSON.stringify(body) }),
+	twinVoiceConfig: (body: { key?: string; voiceId?: string }) =>
+		req<{ ok: true; voices?: TwinVoice[] }>("/api/twin/voice-config", { method: "POST", body: JSON.stringify(body) }),
+	twinVoices: () => req<{ voices: TwinVoice[] }>("/api/twin/voices"),
+	twinPersona: (body: { persona: string; twinName?: string }) =>
+		req<{ ok: true }>("/api/twin/persona", { method: "POST", body: JSON.stringify(body) }),
+	twinCall: (to: string) => req<{ ok: true; to: string }>("/api/twin/call", { method: "POST", body: JSON.stringify({ to }) }),
 };
+
+export type TwinStatus = {
+	twilio: { connected: boolean; source: "site" | "secret" | null; number: string | null };
+	voice: { hasKey: boolean; source: "site" | "secret" | null; voiceId: string | null };
+	anthropic: boolean;
+	persona: string;
+	twinName: string;
+	webhookUrl: string;
+};
+export type TwinOwnedNumber = { sid: string; phoneNumber: string; name: string; voiceUrl?: string };
+export type TwinVoice = { id: string; name: string; category: string };
 
 // SSE helper for AI chat.
 export async function* streamChat(body: {
