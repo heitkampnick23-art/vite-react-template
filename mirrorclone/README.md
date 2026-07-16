@@ -1,5 +1,10 @@
 # MirrorClone — your phone-callable digital twin
 
+> **Superseded:** the twin now lives inside the main site — set it up at
+> **generateai.build/twin** (no CLI needed: paste your Twilio and ElevenLabs
+> keys there and it wires the phone number automatically). This standalone
+> worker is kept for reference only.
+
 A tiny Cloudflare Worker that answers your dedicated phone number **in your own
 cloned voice**, chats like you (Claude + a persona prompt), and can place
 outbound calls from a one-page dashboard.

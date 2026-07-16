@@ -14,6 +14,7 @@ import deploy from "./routes/deploy";
 import heal from "./routes/heal";
 import templates from "./routes/templates";
 import secrets from "./routes/secrets";
+import twin from "./routes/twin";
 import type { AppEnv } from "./middleware/auth";
 
 const app = new Hono<AppEnv>();
@@ -46,6 +47,7 @@ app.route("/api/deploy", deploy);
 app.route("/api/heal", heal);
 app.route("/api/templates", templates);
 app.route("/api/secrets", secrets);
+app.route("/api/twin", twin);
 app.route("/api/webhooks", webhooks);
 
 app.onError((err, c) => {
