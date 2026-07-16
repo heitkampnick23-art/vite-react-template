@@ -1,0 +1,48 @@
+# Deploys the site (worker + assets) to Cloudflare on every push to main.
+# Replaces the Cloudflare Workers Builds git integration, which has been
+# failing silently since May — this is now the production deploy path.
+#
+# Requires one repository secret: CLOUDFLARE_API_TOKEN
+# (Settings → Secrets and variables → Actions → New repository secret,
+#  created from the "Edit Cloudflare Workers" token template.)
+
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check deploy token is configured
+        env:
+          CFT: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CFT" ]; then
+            echo "::error::Repository secret CLOUDFLARE_API_TOKEN is missing. Add it under Settings → Secrets and variables → Actions, then re-run this workflow."
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Deploy worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
+        run: npx wrangler deploy
