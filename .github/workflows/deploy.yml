@@ -2,7 +2,7 @@
 # Replaces the Cloudflare Workers Builds git integration, which has been
 # failing silently since May — this is now the production deploy path.
 #
-# Requires one repository secret: CLOUDFLARE_API_TOKEN (add in repo Settings)
+# Requires one repository secret: CLOUDFLARE_API_TOKEN (repo Settings -> Secrets)
 # (Settings → Secrets and variables → Actions → New repository secret,
 #  created from the "Edit Cloudflare Workers" token template.)
 
