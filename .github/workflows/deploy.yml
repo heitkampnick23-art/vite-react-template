@@ -97,6 +97,22 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
         run: npx wrangler deploy
 
+      # An old session saved SECRETS_MASTER_KEY with a leading space in its
+      # name, so env.SECRETS_MASTER_KEY has always been undefined (nothing was
+      # ever encrypted with it — safe to mint fresh). Idempotent: only sets it
+      # when the correctly-named secret is absent.
+      - name: Ensure master encryption key
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
+        run: |
+          if npx wrangler secret list | grep -q '"SECRETS_MASTER_KEY"'; then
+            echo "master key present"
+          else
+            openssl rand -base64 32 | npx wrangler secret put SECRETS_MASTER_KEY
+            echo "master key minted"
+          fi
+
       # The account's 5-cron limit is already used by other workers, so kick
       # the twin's idempotent self-wiring endpoint after each deploy instead.
       - name: Wire twin
