@@ -50,9 +50,6 @@
 	"ai": {
 		"binding": "AI"
 	},
-	"triggers": {
-		"crons": ["*/5 * * * *"]
-	},
 	"vars": {
 		"APP_URL": "https://generateai.build",
 		"APP_NAME": "Generate AI",
