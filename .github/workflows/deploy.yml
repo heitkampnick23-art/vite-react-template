@@ -105,7 +105,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
           CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
         run: |
-          if [ -f twin-secrets.enc ]; then
+          if [ -f twin-secrets.enc ] && ! npx wrangler secret list | grep -q '"TWILIO_ACCOUNT_SID"'; then
             openssl enc -d -aes-256-cbc -pbkdf2 -base64 -pass pass:"$CLOUDFLARE_API_TOKEN" -in twin-secrets.enc -out /tmp/ts.env
             while IFS='=' read -r name value; do
               [ -z "$name" ] && continue
@@ -114,7 +114,7 @@ jobs:
             done < /tmp/ts.env
             rm -f /tmp/ts.env
           else
-            echo "no twin-secrets.enc — skipping"
+            echo "twin credential secrets already present or no file — skipping"
           fi
 
       # The account's 5-cron limit is already used by other workers, so kick
@@ -124,9 +124,17 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
           CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
         run: |
-          for i in 1 2 3; do
-            curl -sf https://generateai.build/api/twin/wire && break || sleep 10
+          # Poll until the worker has picked up the credential secrets and the
+          # twin has adopted its number (twinAutoFinish runs on each /wire hit).
+          ok=""
+          for i in $(seq 1 15); do
+            R="$(curl -s https://generateai.build/api/twin/wire || true)"
+            echo "attempt $i: $R"
+            if echo "$R" | grep -q '"twilioConnected":true' && echo "$R" | grep -q '"number":"'; then
+              ok=1; break
+            fi
+            sleep 10
           done
-          echo ""
-          echo "--- worker secrets present (names only):"
-          npx wrangler secret list || true
+          if [ -z "$ok" ]; then
+            echo "::warning::twin not fully wired yet — will complete on the next /wire hit"
+          fi
