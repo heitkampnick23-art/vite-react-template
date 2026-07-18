@@ -85,14 +85,14 @@ jobs:
         run: |
           if [ -f twin-bootstrap.enc ]; then
             echo "bootstrap file found ($(wc -c < twin-bootstrap.enc) bytes)"
-            openssl enc -d -aes-256-cbc -pbkdf2 -base64 -pass pass:"$CLOUDFLARE_API_TOKEN" -in twin-bootstrap.enc -out /tmp/twin-bootstrap.sql
-            echo "decrypted to $(wc -l < /tmp/twin-bootstrap.sql) SQL lines; keys referenced:"
-            grep -oE "'(twilio_sid|twilio_token|eleven_key)'" /tmp/twin-bootstrap.sql | sort -u
-            echo "--- applying to remote D1:"
-            npx wrangler d1 execute generate-ai --remote --file /tmp/twin-bootstrap.sql
-            rm -f /tmp/twin-bootstrap.sql
+            # Decrypt to a shell var and apply via the query API (--command).
+            # NOTE: --file uses D1's bulk-import API, which this token can't use
+            # (auth error 10000); --command uses the query API, which it can.
+            SQL="$(openssl enc -d -aes-256-cbc -pbkdf2 -base64 -pass pass:"$CLOUDFLARE_API_TOKEN" -in twin-bootstrap.enc)"
+            echo "decrypted $(printf '%s' "$SQL" | wc -l) SQL lines"
+            npx wrangler d1 execute generate-ai --remote --command "$SQL"
             echo "--- twin_config keys now present in remote D1:"
-            npx wrangler d1 execute generate-ai --remote --command "SELECT key FROM twin_config ORDER BY key" || echo "readback failed"
+            npx wrangler d1 execute generate-ai --remote --command "SELECT key FROM twin_config ORDER BY key"
           else
             echo "no bootstrap file — skipping"
           fi
