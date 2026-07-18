@@ -54,6 +54,25 @@ async function ensureTable(db: D1Database) {
 			)`,
 		)
 		.run();
+	await db
+		.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_calls (
+				id TEXT PRIMARY KEY, from_number TEXT, transcript TEXT NOT NULL,
+				started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			)`,
+		)
+		.run();
+}
+
+// Persist the running transcript so the owner can read every conversation later.
+async function saveTranscript(env: Env, callSid: string, from: string | null, history: Turn[]) {
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_calls (id, from_number, transcript, started_at, updated_at) VALUES (?,?,?,?,?)
+			 ON CONFLICT(id) DO UPDATE SET transcript = excluded.transcript, updated_at = excluded.updated_at`,
+		)
+		.bind(callSid, from, JSON.stringify(history), Date.now(), Date.now())
+		.run();
 }
 
 async function cfgSet(c: Context<AppEnv>, key: string, value: string) {
@@ -267,6 +286,7 @@ twin.post("/voice/incoming", async (c) => {
 	const greeting = `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
 	const callSid = params.get("CallSid") ?? "unknown";
 	await saveConvo(c.env, callSid, [{ role: "assistant", content: greeting }]);
+	await saveTranscript(c.env, callSid, params.get("From"), [{ role: "assistant", content: greeting }]);
 	const audio = await speak(c.env, cfg, greeting);
 	return xml(gather(c.env, audio, greeting));
 });
@@ -286,6 +306,7 @@ twin.post("/voice/respond", async (c) => {
 	const reply = await personaReply(c.env, cfg, history);
 	history.push({ role: "assistant", content: reply });
 	await saveConvo(c.env, callSid, history);
+	await saveTranscript(c.env, callSid, params.get("From"), history);
 
 	const audio = await speak(c.env, cfg, reply);
 	if (/\b(goodbye|bye|talk later|hang up)\b/i.test(heard)) {
@@ -297,6 +318,21 @@ twin.post("/voice/respond", async (c) => {
 // ==============================================================================
 // Setup + control endpoints (site session, owner only)
 // ==============================================================================
+
+// Recent call transcripts for the owner.
+twin.get("/calls", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	const rows = await c.env.DB
+		.prepare("SELECT id, from_number, transcript, started_at FROM twin_calls ORDER BY started_at DESC LIMIT 20")
+		.all<{ id: string; from_number: string | null; transcript: string; started_at: number }>();
+	const calls = (rows.results ?? []).map((r) => ({
+		id: r.id,
+		from: r.from_number,
+		startedAt: r.started_at,
+		turns: JSON.parse(r.transcript) as Turn[],
+	}));
+	return c.json({ calls });
+});
 
 twin.get("/status", ownerOnly, async (c) => {
 	const cfg = await loadCfg(c.env);

@@ -34,7 +34,7 @@ heal.post("/:id/approve", async (c) => {
 		.prepare("UPDATE heal_events SET status = 'approved', resolved_at = ? WHERE id = ?")
 		.bind(Date.now(), id)
 		.run();
-	await c.env.JOBS.send({ kind: "deploy", projectId: row.project_id, fromHealId: id });
+	if (c.env.JOBS) await c.env.JOBS.send({ kind: "deploy", projectId: row.project_id, fromHealId: id });
 	return c.json({ ok: true });
 });
 

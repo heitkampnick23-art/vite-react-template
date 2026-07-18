@@ -73,6 +73,10 @@ export const api = {
 	twinPersona: (body: { persona: string; twinName?: string }) =>
 		req<{ ok: true }>("/api/twin/persona", { method: "POST", body: JSON.stringify(body) }),
 	twinCall: (to: string) => req<{ ok: true; to: string }>("/api/twin/call", { method: "POST", body: JSON.stringify({ to }) }),
+	twinCalls: () =>
+		req<{ calls: Array<{ id: string; from: string | null; startedAt: number; turns: Array<{ role: "user" | "assistant"; content: string }> }> }>(
+			"/api/twin/calls",
+		),
 };
 
 export type TwinStatus = {

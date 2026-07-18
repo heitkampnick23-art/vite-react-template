@@ -3,18 +3,31 @@
 	"name": "vite-react-template",
 	"main": "./src/worker/index.ts",
 	"compatibility_date": "2025-10-08",
-	"compatibility_flags": ["nodejs_compat"],
-	"observability": { "enabled": true },
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
 	"upload_source_maps": true,
 	"assets": {
 		"directory": "./dist/client",
 		"binding": "ASSETS",
 		"not_found_handling": "single-page-application",
-		"run_worker_first": ["/api/*", "/auth/*"]
+		"run_worker_first": [
+			"/api/*",
+			"/auth/*"
+		]
 	},
 	"routes": [
-		{ "pattern": "generateai.build", "custom_domain": true },
-		{ "pattern": "www.generateai.build", "custom_domain": true }
+		{
+			"pattern": "generateai.build",
+			"custom_domain": true
+		},
+		{
+			"pattern": "www.generateai.build",
+			"custom_domain": true
+		}
 	],
 	"d1_databases": [
 		{
@@ -25,38 +38,18 @@
 		}
 	],
 	"kv_namespaces": [
-		{ "binding": "SESSIONS", "id": "3c828e0a27ed4a6789def59cd2144e77" },
-		{ "binding": "CACHE", "id": "509e8a2e42f645eab89aaf61983cb960" }
-	],
-	"r2_buckets": [
-		{ "binding": "FILES", "bucket_name": "generate-ai-files" },
-		{ "binding": "BUILDS", "bucket_name": "generate-ai-builds" },
-		{ "binding": "LOGS", "bucket_name": "generate-ai-logs" }
-	],
-	"queues": {
-		"producers": [
-			{ "binding": "JOBS", "queue": "generate-ai-jobs" },
-			{ "binding": "HEAL", "queue": "generate-ai-heal" }
-		],
-		"consumers": [
-			{ "queue": "generate-ai-jobs", "max_batch_size": 10, "max_batch_timeout": 5 },
-			{ "queue": "generate-ai-heal", "max_batch_size": 5, "max_batch_timeout": 10 }
-		]
-	},
-	"ai": { "binding": "AI" },
-	"durable_objects": {
-		"bindings": [
-			{ "name": "COUNCIL", "class_name": "CouncilRoom" },
-			{ "name": "LIVEDOC", "class_name": "LiveDoc" },
-			{ "name": "SANDBOX", "class_name": "SandboxSession" }
-		]
-	},
-	"migrations": [
 		{
-			"tag": "v1",
-			"new_classes": ["CouncilRoom", "LiveDoc", "SandboxSession"]
+			"binding": "SESSIONS",
+			"id": "3c828e0a27ed4a6789def59cd2144e77"
+		},
+		{
+			"binding": "CACHE",
+			"id": "509e8a2e42f645eab89aaf61983cb960"
 		}
 	],
+	"ai": {
+		"binding": "AI"
+	},
 	"vars": {
 		"APP_URL": "https://generateai.build",
 		"APP_NAME": "Generate AI",

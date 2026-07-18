@@ -27,6 +27,9 @@ deploy.post(
 			.bind(project.id)
 			.first<{ v: number }>();
 		const version = (lastVersion?.v ?? 0) + 1;
+		if (!c.env.JOBS) {
+			return c.json({ error: "unavailable", message: "One-click project deploys need the paid plan." }, 501);
+		}
 		const id = "d_" + nanoid(14);
 		const now = Date.now();
 		await c.env.DB
