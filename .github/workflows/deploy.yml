@@ -129,7 +129,7 @@ jobs:
           # twinAutoFinish (which buys the local number) runs on each /wire hit.
           sleep 15
           ok=""
-          for i in $(seq 1 18); do
+          for i in $(seq 1 6); do
             R="$(curl -s https://generateai.build/api/twin/wire || true)"
             echo "attempt $i: $R"
             if echo "$R" | grep -q '"number":"+1320'; then
@@ -138,5 +138,5 @@ jobs:
             sleep 10
           done
           if [ -z "$ok" ]; then
-            echo "::warning::local 320 number not provisioned yet — check Twilio balance/availability"
+            echo "::warning::local 320 number not provisioned — see the 'note' field above for the exact Twilio reason"
           fi
