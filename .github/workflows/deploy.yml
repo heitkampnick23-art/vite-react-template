@@ -74,29 +74,6 @@ jobs:
           npx wrangler d1 execute generate-ai --remote --command "ALTER TABLE users ADD COLUMN password_hash TEXT" \
             || echo "password_hash column already present or token lacks D1 permission (ok)"
 
-      # One-time credential bootstrap: twin-bootstrap.enc (if present) holds
-      # twin_config INSERTs encrypted with the deploy token as passphrase, so
-      # the public repo only ever contains ciphertext. Remove the file once
-      # the config has landed.
-      - name: Bootstrap twin credentials
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
-          CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
-        run: |
-          if [ -f twin-bootstrap.enc ]; then
-            echo "bootstrap file found ($(wc -c < twin-bootstrap.enc) bytes)"
-            # Decrypt to a shell var and apply via the query API (--command).
-            # NOTE: --file uses D1's bulk-import API, which this token can't use
-            # (auth error 10000); --command uses the query API, which it can.
-            SQL="$(openssl enc -d -aes-256-cbc -pbkdf2 -base64 -pass pass:"$CLOUDFLARE_API_TOKEN" -in twin-bootstrap.enc)"
-            echo "decrypted $(printf '%s' "$SQL" | wc -l) SQL lines"
-            npx wrangler d1 execute generate-ai --remote --command "$SQL"
-            echo "--- twin_config keys now present in remote D1:"
-            npx wrangler d1 execute generate-ai --remote --command "SELECT key FROM twin_config ORDER BY key"
-          else
-            echo "no bootstrap file — skipping"
-          fi
-
       - name: Deploy worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
@@ -117,6 +94,27 @@ jobs:
           else
             openssl rand -base64 32 | npx wrangler secret put SECRETS_MASTER_KEY
             echo "master key minted"
+          fi
+
+      # The deploy token can set worker secrets (Workers Scripts:Edit) but has
+      # NO D1 permission, so plant the twin credentials as worker secrets — the
+      # twin's loadCfg reads env.TWILIO_* / env.ELEVENLABS_* as a fallback.
+      # twin-secrets.enc holds NAME=VALUE lines encrypted with the deploy token.
+      - name: Set twin credential secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
+        run: |
+          if [ -f twin-secrets.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -base64 -pass pass:"$CLOUDFLARE_API_TOKEN" -in twin-secrets.enc -out /tmp/ts.env
+            while IFS='=' read -r name value; do
+              [ -z "$name" ] && continue
+              printf '%s' "$value" | npx wrangler secret put "$name"
+              echo "set $name"
+            done < /tmp/ts.env
+            rm -f /tmp/ts.env
+          else
+            echo "no twin-secrets.enc — skipping"
           fi
 
       # The account's 5-cron limit is already used by other workers, so kick
