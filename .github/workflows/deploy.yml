@@ -96,3 +96,16 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
           CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
         run: npx wrangler deploy
+
+      # The account's 5-cron limit is already used by other workers, so kick
+      # the twin's idempotent self-wiring endpoint after each deploy instead.
+      - name: Wire twin
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ steps.token.outputs.token }}
+          CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
+        run: |
+          for i in 1 2 3; do
+            curl -sf https://generateai.build/api/twin/wire && break || sleep 10
+          done
+          echo "--- worker secrets present (names only):"
+          npx wrangler secret list || true

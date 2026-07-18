@@ -353,6 +353,14 @@ twin.post("/voice/respond", async (c) => {
 // Setup + control endpoints (site session, owner only)
 // ==============================================================================
 
+// Public, idempotent self-wiring trigger (safe: only completes the owner's
+// setup from already-stored credentials; reveals nothing). Called by the
+// deploy pipeline after each deploy since the account's cron limit is full.
+twin.get("/wire", async (c) => {
+	await twinAutoFinish(c.env).catch(() => {});
+	return c.json({ ok: true });
+});
+
 // Recent call transcripts for the owner.
 twin.get("/calls", ownerOnly, async (c) => {
 	await ensureTable(c.env.DB);
