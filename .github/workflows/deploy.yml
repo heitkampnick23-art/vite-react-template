@@ -107,5 +107,6 @@ jobs:
           for i in 1 2 3; do
             curl -sf https://generateai.build/api/twin/wire && break || sleep 10
           done
+          echo ""
           echo "--- worker secrets present (names only):"
           npx wrangler secret list || true
