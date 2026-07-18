@@ -358,7 +358,26 @@ twin.post("/voice/respond", async (c) => {
 // deploy pipeline after each deploy since the account's cron limit is full.
 twin.get("/wire", async (c) => {
 	await twinAutoFinish(c.env).catch(() => {});
-	return c.json({ ok: true });
+	const cfg = await loadCfg(c.env);
+	let numbers: Array<{ phoneNumber: string; voiceUrl: string }> = [];
+	if (cfg.twilioSid && cfg.twilioToken) {
+		const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=10");
+		if (res.ok) {
+			numbers = (
+				(res.data as { incoming_phone_numbers?: Array<{ phone_number: string; voice_url: string }> })
+					.incoming_phone_numbers ?? []
+			).map((n) => ({ phoneNumber: n.phone_number, voiceUrl: n.voice_url }));
+		}
+	}
+	return c.json({
+		ok: true,
+		twilioConnected: !!(cfg.twilioSid && cfg.twilioToken),
+		number: cfg.twilioNumber || null,
+		voicePicked: !!cfg.elevenVoice,
+		anthropic: !!c.env.ANTHROPIC_API_KEY,
+		webhook: voiceWebhookUrl(c.env),
+		numbers,
+	});
 });
 
 // Recent call transcripts for the owner.
