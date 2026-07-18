@@ -16,6 +16,8 @@ declare namespace Cloudflare {
 		STRIPE_SECRET: string;
 		STRIPE_WEBHOOK_SECRET: string;
 		OWNER_EMAIL: string;
+		// Desired local area code for auto-provisioning the twin's number.
+		TWIN_BUY_AREA_CODE: string;
 		// Phone-twin fallbacks — used only if not configured via the /twin page.
 		TWILIO_ACCOUNT_SID: string;
 		TWILIO_AUTH_TOKEN: string;

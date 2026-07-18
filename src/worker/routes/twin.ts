@@ -110,17 +110,48 @@ export async function twinAutoFinish(env: Env) {
 			if (v) await dbSet(env, "eleven_voice", v.voice_id);
 		}
 	}
-	if (cfg.twilioSid && cfg.twilioToken && !cfg.twilioNumber) {
-		const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=1");
-		if (res.ok) {
-			const n = (res.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string }> })
-				.incoming_phone_numbers?.[0];
-			if (n) {
-				await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${n.sid}.json`, {
+	if (cfg.twilioSid && cfg.twilioToken) {
+		// Toll-free numbers (8xx) hit carrier verification and return a "cannot
+		// be completed as dialed" intercept. If a desired local area code is
+		// configured and the twin has no number or only a toll-free one, buy a
+		// local number in that area code (routes instantly) and switch to it.
+		const area = String(env.TWIN_BUY_AREA_CODE || "").replace(/\D/g, "").slice(0, 3);
+		const tollFree = /^\+1(800|888|877|866|855|844|833)/.test(cfg.twilioNumber || "");
+		if (area.length === 3 && (!cfg.twilioNumber || tollFree)) {
+			const search = await twilioApi(
+				cfg.twilioSid,
+				cfg.twilioToken,
+				`/AvailablePhoneNumbers/US/Local.json?VoiceEnabled=true&PageSize=5&AreaCode=${area}`,
+			);
+			const avail = (
+				(search.data as { available_phone_numbers?: Array<{ phone_number: string }> }).available_phone_numbers ?? []
+			)[0];
+			if (avail) {
+				const buy = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", {
+					PhoneNumber: avail.phone_number,
 					VoiceUrl: voiceWebhookUrl(env),
 					VoiceMethod: "POST",
 				});
-				await dbSet(env, "twilio_number", n.phone_number);
+				if (buy.ok) {
+					await dbSet(env, "twilio_number", (buy.data as { phone_number: string }).phone_number);
+					return;
+				}
+			}
+		}
+		// No area code configured (or purchase unavailable): adopt the account's
+		// first existing number if none is set yet.
+		if (!cfg.twilioNumber) {
+			const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=1");
+			if (res.ok) {
+				const n = (res.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string }> })
+					.incoming_phone_numbers?.[0];
+				if (n) {
+					await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${n.sid}.json`, {
+						VoiceUrl: voiceWebhookUrl(env),
+						VoiceMethod: "POST",
+					});
+					await dbSet(env, "twilio_number", n.phone_number);
+				}
 			}
 		}
 	}
