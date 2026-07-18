@@ -100,7 +100,7 @@ async function cfgSet(c: Context<AppEnv>, key: string, value: string) {
 // credentials exist in twin_config — picks the first cloned ElevenLabs voice,
 // adopts the account's first phone number, and points its voice webhook here.
 // Runs from the cron trigger and on /status loads; safe to call repeatedly.
-export async function twinAutoFinish(env: Env) {
+export async function twinAutoFinish(env: Env): Promise<string> {
 	const cfg = await loadCfg(env);
 	if (cfg.elevenKey && !cfg.elevenVoice) {
 		const res = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
@@ -123,20 +123,22 @@ export async function twinAutoFinish(env: Env) {
 				cfg.twilioToken,
 				`/AvailablePhoneNumbers/US/Local.json?VoiceEnabled=true&PageSize=5&AreaCode=${area}`,
 			);
-			const avail = (
-				(search.data as { available_phone_numbers?: Array<{ phone_number: string }> }).available_phone_numbers ?? []
-			)[0];
-			if (avail) {
-				const buy = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", {
-					PhoneNumber: avail.phone_number,
-					VoiceUrl: voiceWebhookUrl(env),
-					VoiceMethod: "POST",
-				});
-				if (buy.ok) {
-					await dbSet(env, "twilio_number", (buy.data as { phone_number: string }).phone_number);
-					return;
-				}
+			if (!search.ok) {
+				return `search failed: ${(search.data as { message?: string }).message ?? search.status}`;
 			}
+			const list =
+				(search.data as { available_phone_numbers?: Array<{ phone_number: string }> }).available_phone_numbers ?? [];
+			if (!list.length) return `no numbers available in area code ${area}`;
+			const buy = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", {
+				PhoneNumber: list[0].phone_number,
+				VoiceUrl: voiceWebhookUrl(env),
+				VoiceMethod: "POST",
+			});
+			if (!buy.ok) {
+				return `purchase failed: ${(buy.data as { message?: string }).message ?? buy.status}`;
+			}
+			await dbSet(env, "twilio_number", (buy.data as { phone_number: string }).phone_number);
+			return `bought ${(buy.data as { phone_number: string }).phone_number}`;
 		}
 		// No area code configured (or purchase unavailable): adopt the account's
 		// first existing number if none is set yet.
@@ -151,10 +153,12 @@ export async function twinAutoFinish(env: Env) {
 						VoiceMethod: "POST",
 					});
 					await dbSet(env, "twilio_number", n.phone_number);
+					return `adopted ${n.phone_number}`;
 				}
 			}
 		}
 	}
+	return "idle";
 }
 
 type TwinCfg = {
@@ -388,7 +392,7 @@ twin.post("/voice/respond", async (c) => {
 // setup from already-stored credentials; reveals nothing). Called by the
 // deploy pipeline after each deploy since the account's cron limit is full.
 twin.get("/wire", async (c) => {
-	await twinAutoFinish(c.env).catch(() => {});
+	const note = await twinAutoFinish(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
 	const cfg = await loadCfg(c.env);
 	let numbers: Array<{ phoneNumber: string; voiceUrl: string }> = [];
 	if (cfg.twilioSid && cfg.twilioToken) {
@@ -408,6 +412,7 @@ twin.get("/wire", async (c) => {
 		anthropic: !!c.env.ANTHROPIC_API_KEY,
 		webhook: voiceWebhookUrl(c.env),
 		numbers,
+		note,
 	});
 });
 
