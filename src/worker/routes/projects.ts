@@ -124,7 +124,7 @@ projects.get("/:slug/file", async (c) => {
 	if (!f) return c.json({ error: "not_found" }, 404);
 	if (f.content_inline !== null) return c.json({ path, content: f.content_inline });
 	if (f.content_r2_key) {
-		const obj = await c.env.FILES.get(f.content_r2_key);
+		const obj = c.env.FILES ? await c.env.FILES.get(f.content_r2_key) : null;
 		const content = obj ? await obj.text() : "";
 		return c.json({ path, content });
 	}
@@ -143,7 +143,12 @@ projects.put(
 		const inline = size < 32_000;
 		const id = "f_" + nanoid(14);
 		const key = inline ? null : `${row.id}/${path}`;
-		if (!inline) await c.env.FILES.put(key!, content);
+		if (!inline) {
+			if (!c.env.FILES) {
+				return c.json({ error: "file_too_large", message: "Files over 32KB need cloud file storage (paid plan)." }, 413);
+			}
+			await c.env.FILES.put(key!, content);
+		}
 		const hash = await sha256(content);
 		const now = Date.now();
 		await c.env.DB

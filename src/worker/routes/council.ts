@@ -22,6 +22,9 @@ council.post(
 		}
 		const { prompt, projectId } = c.req.valid("json");
 		const runId = "cr_" + nanoid(14);
+		if (!c.env.COUNCIL) {
+			return c.json({ error: "unavailable", message: "Council mode needs the paid plan." }, 501);
+		}
 		const now = Date.now();
 		await c.env.DB
 			.prepare(
@@ -46,6 +49,9 @@ council.post(
 
 // GET /council/:id/stream — SSE relay from DO
 council.get("/:id/stream", async (c) => {
+	if (!c.env.COUNCIL) {
+		return c.json({ error: "unavailable", message: "Council mode needs the paid plan." }, 501);
+	}
 	const id = c.env.COUNCIL.idFromName(c.req.param("id"));
 	const stub = c.env.COUNCIL.get(id);
 	return stub.fetch(new Request("https://do/stream"));

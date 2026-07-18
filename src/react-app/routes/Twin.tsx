@@ -35,6 +35,7 @@ const inputCls =
 export function Twin() {
 	const qc = useQueryClient();
 	const status = useQuery({ queryKey: ["twin-status"], queryFn: api.twinStatus, retry: false });
+	const calls = useQuery({ queryKey: ["twin-calls"], queryFn: api.twinCalls, retry: false, refetchInterval: 30_000 });
 
 	const [sid, setSid] = useState("");
 	const [token, setToken] = useState("");
@@ -291,6 +292,28 @@ export function Twin() {
 					</Button>
 				</div>
 				{callResult && <div className="mt-2 text-xs text-zinc-400">{callResult}</div>}
+			</Card>
+
+			{/* Transcripts */}
+			<Card className="mt-4">
+				<div className="font-semibold">Recent conversations</div>
+				<p className="mt-1 text-xs text-zinc-500">Everything your twin talks about, saved as text. Newest first.</p>
+				{calls.data?.calls.length === 0 && <div className="mt-3 text-sm text-zinc-500">No calls yet — dial your number and say hi.</div>}
+				{calls.data?.calls.map((call) => (
+					<details key={call.id} className="mt-3 rounded-lg border border-white/5 bg-black/20 p-3 text-sm">
+						<summary className="cursor-pointer">
+							<span className="tabular-nums">{call.from ?? "unknown caller"}</span>
+							<span className="ml-2 text-xs text-zinc-500">{new Date(call.startedAt).toLocaleString()}</span>
+						</summary>
+						<div className="mt-2 space-y-1">
+							{call.turns.map((t, i) => (
+								<div key={i} className={t.role === "assistant" ? "text-brand-300" : "text-zinc-200"}>
+									<b>{t.role === "assistant" ? "Twin" : "Caller"}:</b> {t.content}
+								</div>
+							))}
+						</div>
+					</details>
+				))}
 			</Card>
 		</div>
 	);
