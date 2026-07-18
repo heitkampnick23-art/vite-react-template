@@ -84,9 +84,15 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: 4d259cf98fff468b0108b6a80b7a10fc
         run: |
           if [ -f twin-bootstrap.enc ]; then
+            echo "bootstrap file found ($(wc -c < twin-bootstrap.enc) bytes)"
             openssl enc -d -aes-256-cbc -pbkdf2 -base64 -pass pass:"$CLOUDFLARE_API_TOKEN" -in twin-bootstrap.enc -out /tmp/twin-bootstrap.sql
-            npx wrangler d1 execute generate-ai --remote --file /tmp/twin-bootstrap.sql > /dev/null && echo "twin credentials planted"
+            echo "decrypted to $(wc -l < /tmp/twin-bootstrap.sql) SQL lines; keys referenced:"
+            grep -oE "'(twilio_sid|twilio_token|eleven_key)'" /tmp/twin-bootstrap.sql | sort -u
+            echo "--- applying to remote D1:"
+            npx wrangler d1 execute generate-ai --remote --file /tmp/twin-bootstrap.sql
             rm -f /tmp/twin-bootstrap.sql
+            echo "--- twin_config keys now present in remote D1:"
+            npx wrangler d1 execute generate-ai --remote --command "SELECT key FROM twin_config ORDER BY key" || echo "readback failed"
           else
             echo "no bootstrap file — skipping"
           fi
