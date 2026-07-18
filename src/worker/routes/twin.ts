@@ -75,21 +75,55 @@ async function saveTranscript(env: Env, callSid: string, from: string | null, hi
 		.run();
 }
 
-async function cfgSet(c: Context<AppEnv>, key: string, value: string) {
+async function dbSet(env: Env, key: string, value: string) {
 	let stored = value;
 	let iv: string | null = null;
 	if (SECRET_KEYS.has(key)) {
-		const enc = await encryptSecret(value, c.env.SECRETS_MASTER_KEY);
+		const enc = await encryptSecret(value, env.SECRETS_MASTER_KEY);
 		stored = enc.ciphertext;
 		iv = enc.iv;
 	}
-	await c.env.DB
+	await env.DB
 		.prepare(
 			`INSERT INTO twin_config (key, value, iv, updated_at) VALUES (?,?,?,?)
 			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, iv = excluded.iv, updated_at = excluded.updated_at`,
 		)
 		.bind(key, stored, iv, Date.now())
 		.run();
+}
+
+async function cfgSet(c: Context<AppEnv>, key: string, value: string) {
+	await dbSet(c.env, key, value);
+}
+
+// Self-wiring: completes any setup steps that can be done automatically once
+// credentials exist in twin_config — picks the first cloned ElevenLabs voice,
+// adopts the account's first phone number, and points its voice webhook here.
+// Runs from the cron trigger and on /status loads; safe to call repeatedly.
+export async function twinAutoFinish(env: Env) {
+	const cfg = await loadCfg(env);
+	if (cfg.elevenKey && !cfg.elevenVoice) {
+		const res = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
+		if (res.ok) {
+			const data = (await res.json()) as { voices?: Array<{ voice_id: string; category?: string }> };
+			const v = (data.voices ?? []).find((x) => x.category === "cloned") ?? (data.voices ?? [])[0];
+			if (v) await dbSet(env, "eleven_voice", v.voice_id);
+		}
+	}
+	if (cfg.twilioSid && cfg.twilioToken && !cfg.twilioNumber) {
+		const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=1");
+		if (res.ok) {
+			const n = (res.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string }> })
+				.incoming_phone_numbers?.[0];
+			if (n) {
+				await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${n.sid}.json`, {
+					VoiceUrl: voiceWebhookUrl(env),
+					VoiceMethod: "POST",
+				});
+				await dbSet(env, "twilio_number", n.phone_number);
+			}
+		}
+	}
 }
 
 type TwinCfg = {
@@ -335,6 +369,7 @@ twin.get("/calls", ownerOnly, async (c) => {
 });
 
 twin.get("/status", ownerOnly, async (c) => {
+	await twinAutoFinish(c.env).catch(() => {});
 	const cfg = await loadCfg(c.env);
 	return c.json({
 		twilio: {

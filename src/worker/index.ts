@@ -14,7 +14,7 @@ import deploy from "./routes/deploy";
 import heal from "./routes/heal";
 import templates from "./routes/templates";
 import secrets from "./routes/secrets";
-import twin from "./routes/twin";
+import twin, { twinAutoFinish } from "./routes/twin";
 import type { AppEnv } from "./middleware/auth";
 
 const app = new Hono<AppEnv>();
@@ -73,10 +73,11 @@ export default {
 		}
 	},
 	async scheduled(_controller: ScheduledController, env: Env) {
-		// Hourly: expire old sessions, KV cache cleanup.
+		// Expire old sessions and finish any pending twin self-wiring.
 		await env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(Date.now()).run();
 		await env.DB.prepare("DELETE FROM oauth_states WHERE expires_at < ?").bind(Date.now()).run();
 		await env.DB.prepare("DELETE FROM magic_links WHERE expires_at < ?").bind(Date.now()).run();
+		await twinAutoFinish(env).catch((e) => console.error("twin autofinish", e));
 	},
 } satisfies ExportedHandler<Env>;
 
