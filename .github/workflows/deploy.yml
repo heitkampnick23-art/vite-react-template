@@ -1,4 +1,4 @@
-# Deploys the site (worker + static assets) to Cloudflare on every push to main.
+# Deploys the site (worker + static assets) to Cloudflare on push to main.
 # Replaces the Cloudflare Workers Builds git integration, which has been
 # failing silently since May — this is now the production deploy path.
 #
