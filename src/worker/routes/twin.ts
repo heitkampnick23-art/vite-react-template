@@ -129,16 +129,42 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 			const list =
 				(search.data as { available_phone_numbers?: Array<{ phone_number: string }> }).available_phone_numbers ?? [];
 			if (!list.length) return `no numbers available in area code ${area}`;
-			const buy = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", {
-				PhoneNumber: list[0].phone_number,
-				VoiceUrl: voiceWebhookUrl(env),
-				VoiceMethod: "POST",
-			});
+			const doBuy = () =>
+				twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", {
+					PhoneNumber: list[0].phone_number,
+					VoiceUrl: voiceWebhookUrl(env),
+					VoiceMethod: "POST",
+				});
+			let buy = await doBuy();
+			// Trial accounts allow only one number. Since the toll-free number is
+			// unusable (carrier intercept), release it and retry the local buy —
+			// a local trial number at least routes (with a trial greeting).
+			let released = "";
+			if (!buy.ok && tollFree && /only one/i.test((buy.data as { message?: string }).message ?? "")) {
+				const owned = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=20");
+				const cur = (
+					(owned.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string }> })
+						.incoming_phone_numbers ?? []
+				).find((n) => n.phone_number === cfg.twilioNumber);
+				if (cur) {
+					const del = await twilioApi(
+						cfg.twilioSid,
+						cfg.twilioToken,
+						`/IncomingPhoneNumbers/${cur.sid}.json`,
+						undefined,
+						"DELETE",
+					);
+					if (del.ok) {
+						released = cfg.twilioNumber;
+						buy = await doBuy();
+					}
+				}
+			}
 			if (!buy.ok) {
-				return `purchase failed: ${(buy.data as { message?: string }).message ?? buy.status}`;
+				return `purchase failed${released ? ` (released ${released})` : ""}: ${(buy.data as { message?: string }).message ?? buy.status}`;
 			}
 			await dbSet(env, "twilio_number", (buy.data as { phone_number: string }).phone_number);
-			return `bought ${(buy.data as { phone_number: string }).phone_number}`;
+			return `bought ${(buy.data as { phone_number: string }).phone_number}${released ? ` (released ${released})` : ""}`;
 		}
 		// No area code configured (or purchase unavailable): adopt the account's
 		// first existing number if none is set yet.
@@ -214,16 +240,17 @@ async function twilioApi(
 	token: string,
 	path: string,
 	body?: Record<string, string>,
+	method?: "GET" | "POST" | "DELETE",
 ): Promise<{ ok: boolean; status: number; data: unknown }> {
 	const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}${path}`, {
-		method: body ? "POST" : "GET",
+		method: method ?? (body ? "POST" : "GET"),
 		headers: {
 			Authorization: twilioAuth(sid, token),
 			...(body ? { "content-type": "application/x-www-form-urlencoded" } : {}),
 		},
 		body: body ? new URLSearchParams(body) : undefined,
 	});
-	const data = await res.json().catch(() => ({}));
+	const data = res.status === 204 ? {} : await res.json().catch(() => ({}));
 	return { ok: res.ok, status: res.status, data };
 }
 
