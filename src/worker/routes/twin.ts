@@ -422,6 +422,9 @@ twin.get("/wire", async (c) => {
 	const note = await twinAutoFinish(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
 	const cfg = await loadCfg(c.env);
 	let numbers: Array<{ phoneNumber: string; voiceUrl: string }> = [];
+	let accountType = "";
+	let accountStatus = "";
+	let balance = "";
 	if (cfg.twilioSid && cfg.twilioToken) {
 		const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=10");
 		if (res.ok) {
@@ -429,6 +432,17 @@ twin.get("/wire", async (c) => {
 				(res.data as { incoming_phone_numbers?: Array<{ phone_number: string; voice_url: string }> })
 					.incoming_phone_numbers ?? []
 			).map((n) => ({ phoneNumber: n.phone_number, voiceUrl: n.voice_url }));
+		}
+		// Account type ("Trial" vs "Full") and balance — the definitive status.
+		const acct = await twilioApi(cfg.twilioSid, cfg.twilioToken, ".json");
+		if (acct.ok) {
+			accountType = (acct.data as { type?: string }).type ?? "";
+			accountStatus = (acct.data as { status?: string }).status ?? "";
+		}
+		const bal = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Balance.json");
+		if (bal.ok) {
+			const b = bal.data as { balance?: string; currency?: string };
+			balance = `${b.balance ?? "?"} ${b.currency ?? ""}`.trim();
 		}
 	}
 	return c.json({
@@ -439,6 +453,9 @@ twin.get("/wire", async (c) => {
 		anthropic: !!c.env.ANTHROPIC_API_KEY,
 		webhook: voiceWebhookUrl(c.env),
 		numbers,
+		accountType,
+		accountStatus,
+		balance,
 		note,
 	});
 });
