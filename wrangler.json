@@ -54,6 +54,7 @@
 		"APP_URL": "https://generateai.build",
 		"APP_NAME": "Generate AI",
 		"OWNER_EMAIL": "heitkampnick23@gmail.com",
-		"TWIN_BUY_AREA_CODE": "320"
+		"TWIN_BUY_AREA_CODE": "320",
+		"TWIN_VOICE_SPEED": "1.12"
 	}
 }
