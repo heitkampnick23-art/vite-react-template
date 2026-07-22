@@ -20,6 +20,8 @@ declare namespace Cloudflare {
 		TWIN_BUY_AREA_CODE: string;
 		// Twin voice playback speed (ElevenLabs range 0.7–1.2; default 1.12).
 		TWIN_VOICE_SPEED: string;
+		// Owner's preferred ElevenLabs voice id — used when synthesizable.
+		TWIN_VOICE_ID: string;
 		// Phone-twin fallbacks — used only if not configured via the /twin page.
 		TWILIO_ACCOUNT_SID: string;
 		TWILIO_AUTH_TOKEN: string;

@@ -119,9 +119,12 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 				});
 				return t.ok;
 			};
+			const preferred = String(env.TWIN_VOICE_ID || "");
 			const mine = voices.find((x) => x.category === "cloned") ?? voices.find((x) => x.category === "generated");
 			let desired: string | undefined;
-			if (mine && (await ttsWorks(mine.voice_id))) {
+			if (preferred && (await ttsWorks(preferred))) {
+				desired = preferred;
+			} else if (mine && (await ttsWorks(mine.voice_id))) {
 				desired = mine.voice_id;
 			} else if (!cfg.elevenVoice || cfg.elevenVoice === mine?.voice_id || !(await ttsWorks(cfg.elevenVoice))) {
 				// "Chris — charming, down-to-earth" premade; any premade otherwise.
