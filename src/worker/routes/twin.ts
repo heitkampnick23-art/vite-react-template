@@ -436,6 +436,18 @@ twin.post("/voice/respond", async (c) => {
 
 	const audio = await speak(c.env, cfg, reply);
 	if (/\b(goodbye|bye|talk later|hang up)\b/i.test(heard)) {
+		// Text the owner a summary of the finished call.
+		if (c.env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
+			const from = params.get("From") ?? "unknown";
+			const body = `Your twin just finished a call with ${from}. Last thing they said: "${heard.slice(0, 200)}". Full transcript: generateai.build/twin`;
+			c.executionCtx.waitUntil(
+				twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+					To: c.env.TWIN_NOTIFY_CELL,
+					From: cfg.twilioNumber,
+					Body: body,
+				}).then(() => undefined),
+			);
+		}
 		return xml(audio ? `<Play>${escapeXml(audio)}</Play><Hangup/>` : `${SAY}${escapeXml(reply)}</Say><Hangup/>`);
 	}
 	return xml(gather(c.env, audio, reply));

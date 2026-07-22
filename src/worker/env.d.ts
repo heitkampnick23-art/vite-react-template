@@ -22,6 +22,8 @@ declare namespace Cloudflare {
 		TWIN_VOICE_SPEED: string;
 		// Owner's preferred ElevenLabs voice id — used when synthesizable.
 		TWIN_VOICE_ID: string;
+		// Owner's cell for after-call SMS summaries (E.164).
+		TWIN_NOTIFY_CELL: string;
 		// Phone-twin fallbacks — used only if not configured via the /twin page.
 		TWILIO_ACCOUNT_SID: string;
 		TWILIO_AUTH_TOKEN: string;
