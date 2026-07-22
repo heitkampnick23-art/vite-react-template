@@ -465,6 +465,28 @@ twin.get("/wire", async (c) => {
 			elevenVoices = (vd.voices ?? []).map((v) => ({ id: v.voice_id, name: v.name, category: v.category ?? "" }));
 		}
 	}
+	// Live TTS test with the exact settings calls use — reveals why calls fall
+	// back to the generic <Say> voice (plan limits, bad param, etc.).
+	let tts = "not configured";
+	if (cfg.elevenKey && cfg.elevenVoice) {
+		const tr = await fetch(
+			`https://api.elevenlabs.io/v1/text-to-speech/${cfg.elevenVoice}?output_format=mp3_22050_32`,
+			{
+				method: "POST",
+				headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+				body: JSON.stringify({
+					text: "test",
+					model_id: "eleven_turbo_v2_5",
+					voice_settings: {
+						stability: 0.5,
+						similarity_boost: 0.85,
+						speed: Number(c.env.TWIN_VOICE_SPEED) || 1.12,
+					},
+				}),
+			},
+		);
+		tts = tr.ok ? "ok" : `failed ${tr.status}: ${(await tr.text()).slice(0, 400)}`;
+	}
 	return c.json({
 		ok: true,
 		twilioConnected: !!(cfg.twilioSid && cfg.twilioToken),
@@ -479,6 +501,7 @@ twin.get("/wire", async (c) => {
 		voiceId: cfg.elevenVoice || null,
 		elevenKeyOk,
 		elevenVoices,
+		tts,
 		note,
 	});
 });
