@@ -127,6 +127,6 @@ jobs:
           # Give the freshly-deployed worker version time to go live globally,
           # then poll /wire until the twin has provisioned a local (320) number.
           # twinAutoFinish (which buys the local number) runs on each /wire hit.
-          sleep 15
+          sleep 25
           curl -s https://generateai.build/api/twin/wire || true
           echo ""
