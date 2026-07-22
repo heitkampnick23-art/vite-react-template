@@ -102,12 +102,16 @@ async function cfgSet(c: Context<AppEnv>, key: string, value: string) {
 // Runs from the cron trigger and on /status loads; safe to call repeatedly.
 export async function twinAutoFinish(env: Env): Promise<string> {
 	const cfg = await loadCfg(env);
-	if (cfg.elevenKey && !cfg.elevenVoice) {
+	if (cfg.elevenKey) {
 		const res = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
 		if (res.ok) {
 			const data = (await res.json()) as { voices?: Array<{ voice_id: string; category?: string }> };
-			const v = (data.voices ?? []).find((x) => x.category === "cloned") ?? (data.voices ?? [])[0];
-			if (v) await dbSet(env, "eleven_voice", v.voice_id);
+			const voices = data.voices ?? [];
+			// Prefer the user's own cloned/generated voice over ElevenLabs stock
+			// voices, and switch to it even if a default was picked earlier.
+			const mine = voices.find((x) => x.category === "cloned") ?? voices.find((x) => x.category === "generated");
+			const desired = mine?.voice_id ?? (cfg.elevenVoice ? undefined : voices[0]?.voice_id);
+			if (desired && desired !== cfg.elevenVoice) await dbSet(env, "eleven_voice", desired);
 		}
 	}
 	if (cfg.twilioSid && cfg.twilioToken) {
@@ -290,7 +294,12 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 			body: JSON.stringify({
 				text,
 				model_id: "eleven_turbo_v2_5",
-				voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+				voice_settings: {
+					stability: 0.5,
+					similarity_boost: 0.85,
+					// Slightly faster than natural (ElevenLabs range 0.7–1.2).
+					speed: Number(env.TWIN_VOICE_SPEED) || 1.12,
+				},
 			}),
 		},
 	);
@@ -445,6 +454,17 @@ twin.get("/wire", async (c) => {
 			balance = `${b.balance ?? "?"} ${b.currency ?? ""}`.trim();
 		}
 	}
+	// ElevenLabs voice inventory — so we can see which voice is the user's clone.
+	let elevenVoices: Array<{ id: string; name: string; category: string }> = [];
+	let elevenKeyOk = false;
+	if (cfg.elevenKey) {
+		const vr = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
+		elevenKeyOk = vr.ok;
+		if (vr.ok) {
+			const vd = (await vr.json()) as { voices?: Array<{ voice_id: string; name: string; category?: string }> };
+			elevenVoices = (vd.voices ?? []).map((v) => ({ id: v.voice_id, name: v.name, category: v.category ?? "" }));
+		}
+	}
 	return c.json({
 		ok: true,
 		twilioConnected: !!(cfg.twilioSid && cfg.twilioToken),
@@ -456,6 +476,9 @@ twin.get("/wire", async (c) => {
 		accountType,
 		accountStatus,
 		balance,
+		voiceId: cfg.elevenVoice || null,
+		elevenKeyOk,
+		elevenVoices,
 		note,
 	});
 });

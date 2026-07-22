@@ -18,6 +18,8 @@ declare namespace Cloudflare {
 		OWNER_EMAIL: string;
 		// Desired local area code for auto-provisioning the twin's number.
 		TWIN_BUY_AREA_CODE: string;
+		// Twin voice playback speed (ElevenLabs range 0.7–1.2; default 1.12).
+		TWIN_VOICE_SPEED: string;
 		// Phone-twin fallbacks — used only if not configured via the /twin page.
 		TWILIO_ACCOUNT_SID: string;
 		TWILIO_AUTH_TOKEN: string;
