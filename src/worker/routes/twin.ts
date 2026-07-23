@@ -429,6 +429,27 @@ twin.post("/voice/respond", async (c) => {
 
 	const history = await loadConvo(c.env, callSid);
 	history.push({ role: "user", content: heard });
+
+	// Escape hatch: caller urgently needs the real owner — bridge the call to
+	// their cell (caller sees the twin's number so they know it's a transfer).
+	if (
+		c.env.TWIN_NOTIFY_CELL &&
+		/(real (nick|person|human)|speak to nick|talk to nick|transfer me|urgent|emergency|actual (person|human)|right away)/i.test(heard)
+	) {
+		const msg = "You got it — connecting you to the real Nick right now. Hang tight.";
+		history.push({ role: "assistant", content: `${msg} [transferring call]` });
+		await saveConvo(c.env, callSid, history);
+		await saveTranscript(c.env, callSid, params.get("From"), history);
+		const lead = (await speak(c.env, cfg, msg).then((u) => (u ? `<Play>${escapeXml(u)}</Play>` : null))) ??
+			`${SAY}${escapeXml(msg)}</Say>`;
+		const action = `${c.env.APP_URL}/api/twin/voice/respond`;
+		return xml(
+			`${lead}<Dial callerId="${escapeXml(cfg.twilioNumber)}" timeout="25">${escapeXml(c.env.TWIN_NOTIFY_CELL)}</Dial>` +
+				`${SAY}Looks like he could not pick up. I can take a message instead.</Say>` +
+				`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" language="en-US"/>`,
+		);
+	}
+
 	const reply = await personaReply(c.env, cfg, history);
 	history.push({ role: "assistant", content: reply });
 	await saveConvo(c.env, callSid, history);
