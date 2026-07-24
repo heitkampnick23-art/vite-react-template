@@ -430,6 +430,23 @@ twin.post("/voice/respond", async (c) => {
 	const history = await loadConvo(c.env, callSid);
 	history.push({ role: "user", content: heard });
 
+	// The moment a caller asks to be contacted or leaves a message, text the
+	// owner immediately (once per call) — don't wait for a formal goodbye.
+	if (
+		c.env.TWIN_NOTIFY_CELL &&
+		/(call me|text me|contact (me|him)|reach (me|him)|get back to me|leave .{0,15}message|message for|tell (him|nick)|have (him|nick) (call|text)|call.?back|pass (this|it|that) along)/i.test(heard) &&
+		!(await c.env.CACHE.get(`twin:notified:${callSid}`))
+	) {
+		await c.env.CACHE.put(`twin:notified:${callSid}`, "1", { expirationTtl: 3600 });
+		c.executionCtx.waitUntil(
+			twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+				To: c.env.TWIN_NOTIFY_CELL,
+				From: cfg.twilioNumber,
+				Body: `Someone wants you to contact them: ${params.get("From") ?? "unknown"}. They said: "${heard.slice(0, 200)}". Full transcript: generateai.build/twin`,
+			}).then(() => undefined),
+		);
+	}
+
 	// Escape hatch: caller urgently needs the real owner — bridge the call to
 	// their cell (caller sees the twin's number so they know it's a transfer).
 	if (
