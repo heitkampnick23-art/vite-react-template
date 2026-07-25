@@ -191,6 +191,21 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 			await dbSet(env, "twilio_number", (buy.data as { phone_number: string }).phone_number);
 			return `bought ${(buy.data as { phone_number: string }).phone_number}${released ? ` (released ${released})` : ""}`;
 		}
+		// Keep the active number's SMS webhook pointed at the twin.
+		if (cfg.twilioNumber) {
+			const owned = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=20");
+			const cur = (
+				(owned.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string; sms_url?: string }> })
+					.incoming_phone_numbers ?? []
+			).find((n) => n.phone_number === cfg.twilioNumber);
+			const smsUrl = `${env.APP_URL}/api/twin/sms/incoming`;
+			if (cur && cur.sms_url !== smsUrl) {
+				await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${cur.sid}.json`, {
+					SmsUrl: smsUrl,
+					SmsMethod: "POST",
+				});
+			}
+		}
 		// No area code configured (or purchase unavailable): adopt the account's
 		// first existing number if none is set yet.
 		if (!cfg.twilioNumber) {
@@ -575,6 +590,35 @@ twin.get("/wire", async (c) => {
 		tts,
 		note,
 	});
+});
+
+// Inbound SMS to the twin's number. Owner texts "text <number>: <message>"
+// and the twin relays it from its own number; anyone else's text is
+// forwarded to the owner's cell.
+twin.post("/sms/incoming", async (c) => {
+	const cfg = await loadCfg(c.env);
+	const params = new URLSearchParams(await c.req.text());
+	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/sms/incoming`, params, cfg.twilioToken))) {
+		return c.text("unauthorized", 401);
+	}
+	const from = params.get("From") ?? "";
+	const body = (params.get("Body") ?? "").trim();
+	const send = (to: string, text: string) =>
+		twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", { To: to, From: cfg.twilioNumber, Body: text });
+	if (from === c.env.TWIN_NOTIFY_CELL) {
+		const m = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
+		if (m) {
+			let to = m[1].replace(/\D/g, "");
+			if (to.length === 10) to = "1" + to;
+			await send("+" + to, m[2].trim());
+			await send(from, `Sent to +${to}.`);
+		} else {
+			await send(from, 'To relay a text: "text 9525551234: your message"');
+		}
+	} else if (c.env.TWIN_NOTIFY_CELL) {
+		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${from}: ${body.slice(0, 500)}`);
+	}
+	return c.body("<Response></Response>", 200, { "content-type": "text/xml" });
 });
 
 // Recent call transcripts for the owner.
