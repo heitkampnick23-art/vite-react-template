@@ -8,7 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type TwinOwnedNumber, type TwinVoice } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { CheckCircle2, Circle, MessageSquare, Phone, PhoneOutgoing, Mic2, Sparkles, X } from "lucide-react";
+import { CheckCircle2, Circle, MessageSquare, Phone, PhoneForwarded, PhoneOutgoing, Mic2, Sparkles, X } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -92,6 +92,7 @@ export function Twin() {
 		onError: (e) => setCallResult(errMsg(e)),
 	});
 	const contacts = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
+	const forwarding = useQuery({ queryKey: ["twin-forwarding"], queryFn: api.twinForwarding, retry: false });
 	const addContact = useMutation({
 		mutationFn: () => api.twinAddContact({ name: contactName.trim(), phone: contactPhone.trim() }),
 		onSuccess: () => {
@@ -342,6 +343,40 @@ export function Twin() {
 					</div>
 				))}
 			</Card>
+
+			{/* Missed-call forwarding */}
+			{forwarding.data && (
+				<Card className="mt-4">
+					<div className="flex items-center gap-2 font-semibold">
+						<PhoneForwarded className="h-4 w-4" /> Forward your missed calls to the twin
+					</div>
+					<p className="mt-1 text-xs text-zinc-500">
+						Dial one code from your personal phone and every call you miss rings your twin (
+						<span className="tabular-nums text-zinc-300">{forwarding.data.number}</span>) instead of voicemail. Calls
+						you answer are untouched.
+					</p>
+					{forwarding.data.carriers.map((cr) => (
+						<div key={cr.carrier} className="mt-3 text-sm">
+							<div className="text-xs font-semibold text-zinc-400">{cr.carrier}</div>
+							{cr.activate.map((a) => (
+								<div key={a.code} className="flex items-center justify-between border-b border-white/5 py-1.5 last:border-0">
+									<span className="text-xs text-zinc-500">{a.label}</span>
+									<code className="ml-3 shrink-0 rounded bg-black/40 px-2 py-0.5 text-xs text-brand-300">{a.code}</code>
+								</div>
+							))}
+							<div className="flex items-center justify-between py-1.5">
+								<span className="text-xs text-zinc-600">Turn off</span>
+								<code className="ml-3 shrink-0 rounded bg-black/40 px-2 py-0.5 text-xs text-zinc-400">{cr.deactivate}</code>
+							</div>
+						</div>
+					))}
+					<ul className="mt-3 list-disc pl-4 text-xs text-zinc-600">
+						{forwarding.data.notes.map((n) => (
+							<li key={n}>{n}</li>
+						))}
+					</ul>
+				</Card>
+			)}
 
 			{/* Transcripts */}
 			<Card className="mt-4">

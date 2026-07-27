@@ -81,6 +81,7 @@ export const api = {
 	twinAddContact: (body: { name: string; phone: string; notes?: string }) =>
 		req<{ ok: true; phone: string }>("/api/twin/contacts", { method: "POST", body: JSON.stringify(body) }),
 	twinDeleteContact: (id: string) => req<{ ok: true }>(`/api/twin/contacts/${id}`, { method: "DELETE" }),
+	twinForwarding: () => req<TwinForwarding>("/api/twin/forwarding"),
 };
 
 export type TwinStatus = {
@@ -94,6 +95,11 @@ export type TwinStatus = {
 export type TwinOwnedNumber = { sid: string; phoneNumber: string; name: string; voiceUrl?: string };
 export type TwinVoice = { id: string; name: string; category: string };
 export type TwinContact = { id: string; name: string; phone: string; notes: string | null };
+export type TwinForwarding = {
+	number: string;
+	carriers: Array<{ carrier: string; activate: Array<{ label: string; code: string }>; deactivate: string }>;
+	notes: string[];
+};
 
 // SSE helper for AI chat.
 export async function* streamChat(body: {

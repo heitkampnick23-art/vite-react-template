@@ -1005,6 +1005,45 @@ twin.delete("/contacts/:id", ownerOnly, async (c) => {
 	return c.json({ ok: true });
 });
 
+// Carrier dial codes to forward the owner's personal number's missed calls to
+// the twin, prefilled with the twin's number. Dialed from the personal phone.
+twin.get("/forwarding", ownerOnly, async (c) => {
+	const cfg = await loadCfg(c.env);
+	if (!cfg.twilioNumber) return c.json({ error: "no_number", message: "Pick a phone number for the twin first." }, 400);
+	const digits = cfg.twilioNumber.replace(/\D/g, ""); // 13205551234
+	const ten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+	return c.json({
+		number: cfg.twilioNumber,
+		carriers: [
+			{
+				carrier: "AT&T, T-Mobile & most GSM carriers",
+				activate: [{ label: "Forward missed + busy + unreachable calls", code: `**004*${digits}#` }],
+				deactivate: "##004#",
+			},
+			{
+				carrier: "AT&T / T-Mobile — pick conditions individually",
+				activate: [
+					{ label: "When you don't answer", code: `**61*${digits}#` },
+					{ label: "When your phone is off / no signal", code: `**62*${digits}#` },
+					{ label: "When you're on the other line", code: `**67*${digits}#` },
+				],
+				deactivate: "##004#",
+			},
+			{
+				carrier: "Verizon",
+				activate: [{ label: "Forward missed + busy calls", code: `*71${ten}` }],
+				deactivate: "*73",
+			},
+		],
+		notes: [
+			"Dial the code from your personal phone (the one being forwarded), then press call — the carrier confirms with a tone or banner.",
+			"Only unanswered/busy/unreachable calls forward; calls you pick up are untouched.",
+			"Test it: have someone call your personal number and don't answer — your twin should pick up.",
+			"Forwarded minutes may bill against your carrier plan.",
+		],
+	});
+});
+
 // Public, idempotent digest trigger (like /wire): sends at most one digest per
 // local day, only after the digest hour, and reveals nothing. Point any
 // external scheduler at this URL for a guaranteed nightly send.
