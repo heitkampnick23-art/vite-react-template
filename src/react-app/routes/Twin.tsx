@@ -8,7 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type TwinOwnedNumber, type TwinVoice } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { Brain, CheckCircle2, Circle, MessageSquare, Phone, PhoneForwarded, PhoneOutgoing, Mic2, Sparkles, X } from "lucide-react";
+import { Brain, CheckCircle2, Circle, MessageSquare, Phone, PhoneForwarded, PhoneOutgoing, Mic2, Sparkles, Users, X } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -46,10 +46,14 @@ export function Twin() {
 	const [voices, setVoices] = useState<TwinVoice[] | null>(null);
 	const [persona, setPersona] = useState<string | null>(null);
 	const [callTo, setCallTo] = useState("");
+	const [callAs, setCallAs] = useState("");
 	const [callResult, setCallResult] = useState("");
 	const [contactName, setContactName] = useState("");
 	const [contactPhone, setContactPhone] = useState("");
 	const [newFact, setNewFact] = useState("");
+	const [profileName, setProfileName] = useState("");
+	const [profilePersona, setProfilePersona] = useState("");
+	const [profileNumberSid, setProfileNumberSid] = useState("");
 
 	const refresh = () => qc.invalidateQueries({ queryKey: ["twin-status"] });
 
@@ -88,7 +92,7 @@ export function Twin() {
 		onSuccess: () => refresh(),
 	});
 	const call = useMutation({
-		mutationFn: () => api.twinCall(callTo.trim()),
+		mutationFn: () => api.twinCall(callTo.trim(), callAs || undefined),
 		onSuccess: (d) => setCallResult(`Calling ${d.to} now — pick up and say hi to your twin.`),
 		onError: (e) => setCallResult(errMsg(e)),
 	});
@@ -105,6 +109,26 @@ export function Twin() {
 	const deleteFact = useMutation({
 		mutationFn: (id: string) => api.twinDeleteFact(id),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-facts"] }),
+	});
+	const profiles = useQuery({ queryKey: ["twin-profiles"], queryFn: api.twinProfiles, retry: false });
+	const ownedForProfiles = useQuery({ queryKey: ["twin-numbers"], queryFn: api.twinNumbers, retry: false });
+	const saveProfile = useMutation({
+		mutationFn: () =>
+			api.twinSaveProfile({
+				name: profileName.trim(),
+				persona: profilePersona.trim(),
+				numberSid: profileNumberSid || undefined,
+			}),
+		onSuccess: () => {
+			setProfileName("");
+			setProfilePersona("");
+			setProfileNumberSid("");
+			qc.invalidateQueries({ queryKey: ["twin-profiles"] });
+		},
+	});
+	const deleteProfile = useMutation({
+		mutationFn: (id: string) => api.twinDeleteProfile(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-profiles"] }),
 	});
 	const addContact = useMutation({
 		mutationFn: () => api.twinAddContact({ name: contactName.trim(), phone: contactPhone.trim() }),
@@ -316,6 +340,16 @@ export function Twin() {
 				</p>
 				<div className="mt-3 flex gap-2">
 					<input className={inputCls + " max-w-56"} placeholder="+15551234567" value={callTo} onChange={(e) => setCallTo(e.target.value)} />
+					{(profiles.data?.profiles.filter((p) => p.number).length ?? 0) > 0 && (
+						<select className={inputCls + " max-w-44"} value={callAs} onChange={(e) => setCallAs(e.target.value)}>
+							<option value="">As: primary twin</option>
+							{profiles.data!.profiles.filter((p) => p.number).map((p) => (
+								<option key={p.id} value={p.id}>
+									As: {p.name}
+								</option>
+							))}
+						</select>
+					)}
 					<Button size="sm" disabled={!numberDone || !/^\+\d{8,15}$/.test(callTo.trim()) || call.isPending} onClick={() => call.mutate()}>
 						{call.isPending ? "Dialing…" : "Place call"}
 					</Button>
@@ -423,6 +457,65 @@ export function Twin() {
 					</ul>
 				</Card>
 			)}
+
+			{/* Multiple twins */}
+			<Card className="mt-4">
+				<div className="flex items-center gap-2 font-semibold">
+					<Users className="h-4 w-4" /> More twins
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Run several twins, each with its own number and personality — a work twin, a screening twin, a joke twin.
+					Calls and texts to each number get that twin's persona; contacts, facts, and your notification cell are
+					shared.
+				</p>
+				{profiles.data?.profiles.map((p) => (
+					<div key={p.id} className="mt-3 flex items-start justify-between rounded-lg border border-white/5 bg-black/20 p-3 text-sm">
+						<div>
+							<div>
+								<b>{p.name}</b>
+								<span className="ml-2 tabular-nums text-xs text-zinc-500">{p.number ?? "no number yet"}</span>
+							</div>
+							<div className="mt-1 line-clamp-2 text-xs text-zinc-500">{p.persona}</div>
+						</div>
+						<button className="ml-3 shrink-0 text-zinc-600 hover:text-red-400" title="Delete twin" onClick={() => deleteProfile.mutate(p.id)}>
+							<X className="h-4 w-4" />
+						</button>
+					</div>
+				))}
+				<div className="mt-4 flex flex-col gap-2">
+					<div className="text-xs text-zinc-400">Add a twin</div>
+					<input className={inputCls + " max-w-56"} placeholder="Name (e.g. Work Nick)" value={profileName} onChange={(e) => setProfileName(e.target.value)} />
+					<textarea
+						className={inputCls + " min-h-20"}
+						placeholder="Personality — how this twin talks and what it handles"
+						value={profilePersona}
+						onChange={(e) => setProfilePersona(e.target.value)}
+					/>
+					<select className={inputCls + " max-w-72"} value={profileNumberSid} onChange={(e) => setProfileNumberSid(e.target.value)}>
+						<option value="">No number yet (attach later)</option>
+						{ownedForProfiles.data?.numbers
+							.filter((n) => n.phoneNumber !== s.twilio.number && !profiles.data?.profiles.some((p) => p.number === n.phoneNumber))
+							.map((n) => (
+								<option key={n.sid} value={n.sid}>
+									{n.phoneNumber}
+								</option>
+							))}
+					</select>
+					<Button
+						size="sm"
+						className="self-start"
+						disabled={!profileName.trim() || profilePersona.trim().length < 10 || saveProfile.isPending}
+						onClick={() => saveProfile.mutate()}
+					>
+						{saveProfile.isPending ? "Creating…" : "Create twin"}
+					</Button>
+					{saveProfile.isError && <div className="text-xs text-red-400">{errMsg(saveProfile.error)}</div>}
+					<p className="text-xs text-zinc-600">
+						Numbers listed are unused ones already on your Twilio account — buy extras in step 2 above, then attach
+						them here.
+					</p>
+				</div>
+			</Card>
 
 			{/* Transcripts */}
 			<Card className="mt-4">

@@ -72,7 +72,8 @@ export const api = {
 	twinVoices: () => req<{ voices: TwinVoice[] }>("/api/twin/voices"),
 	twinPersona: (body: { persona: string; twinName?: string }) =>
 		req<{ ok: true }>("/api/twin/persona", { method: "POST", body: JSON.stringify(body) }),
-	twinCall: (to: string) => req<{ ok: true; to: string }>("/api/twin/call", { method: "POST", body: JSON.stringify({ to }) }),
+	twinCall: (to: string, profileId?: string) =>
+		req<{ ok: true; to: string }>("/api/twin/call", { method: "POST", body: JSON.stringify({ to, profileId }) }),
 	twinCalls: () =>
 		req<{ calls: Array<{ id: string; from: string | null; startedAt: number; turns: Array<{ role: "user" | "assistant"; content: string }> }> }>(
 			"/api/twin/calls",
@@ -85,6 +86,10 @@ export const api = {
 	twinFacts: () => req<{ facts: TwinFact[] }>("/api/twin/facts"),
 	twinAddFact: (fact: string) => req<{ ok: true }>("/api/twin/facts", { method: "POST", body: JSON.stringify({ fact }) }),
 	twinDeleteFact: (id: string) => req<{ ok: true }>(`/api/twin/facts/${id}`, { method: "DELETE" }),
+	twinProfiles: () => req<{ profiles: TwinProfile[] }>("/api/twin/profiles"),
+	twinSaveProfile: (body: { id?: string; name: string; persona: string; voiceId?: string; numberSid?: string; phoneNumber?: string }) =>
+		req<{ ok: true; id: string; number: string | null }>("/api/twin/profiles", { method: "POST", body: JSON.stringify(body) }),
+	twinDeleteProfile: (id: string) => req<{ ok: true }>(`/api/twin/profiles/${id}`, { method: "DELETE" }),
 };
 
 export type TwinStatus = {
@@ -99,6 +104,7 @@ export type TwinOwnedNumber = { sid: string; phoneNumber: string; name: string; 
 export type TwinVoice = { id: string; name: string; category: string };
 export type TwinContact = { id: string; name: string; phone: string; notes: string | null };
 export type TwinFact = { id: string; fact: string; created_at: number };
+export type TwinProfile = { id: string; name: string; persona: string; number: string | null; voiceId: string | null };
 export type TwinForwarding = {
 	number: string;
 	carriers: Array<{ carrier: string; activate: Array<{ label: string; code: string }>; deactivate: string }>;

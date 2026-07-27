@@ -83,6 +83,12 @@ async function ensureTable(db: D1Database) {
 				id TEXT PRIMARY KEY, fact TEXT NOT NULL, created_at INTEGER NOT NULL
 			)`,
 		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_profiles (
+				id TEXT PRIMARY KEY, name TEXT NOT NULL, persona TEXT NOT NULL,
+				number TEXT UNIQUE, voice_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			)`,
+		),
 	]);
 }
 
@@ -558,6 +564,50 @@ async function loadCfg(env: Env): Promise<TwinCfg> {
 	};
 }
 
+// --- multiple twins ------------------------------------------------------------
+//
+// Extra twins live in twin_profiles, each with its own number, name, persona,
+// and (optionally) voice. Inbound webhooks resolve which twin a call/text is
+// for by the numbers on the wire; everything else (contacts, facts, caller
+// memory, credentials, the owner's cell) is shared.
+
+type TwinProfile = {
+	id: string;
+	name: string;
+	persona: string;
+	number: string | null;
+	voice_id: string | null;
+};
+
+async function loadProfiles(env: Env): Promise<TwinProfile[]> {
+	await ensureTable(env.DB);
+	const rows = await env.DB
+		.prepare("SELECT id, name, persona, number, voice_id FROM twin_profiles ORDER BY created_at")
+		.all<TwinProfile>();
+	return rows.results ?? [];
+}
+
+function applyProfile(cfg: TwinCfg, p: TwinProfile): TwinCfg {
+	return {
+		...cfg,
+		twinName: p.name,
+		persona: p.persona,
+		twilioNumber: p.number ?? cfg.twilioNumber,
+		elevenVoice: p.voice_id || cfg.elevenVoice,
+	};
+}
+
+// Resolve the twin a webhook belongs to. Inbound: To is the twin's number.
+// Outbound (twin-initiated calls): From is the twin's number. The primary
+// twin_config twin stays the default when nothing matches.
+async function overlayProfile(env: Env, cfg: TwinCfg, nums: Array<string | null>): Promise<TwinCfg> {
+	const candidates = nums.filter((n): n is string => !!n && n !== cfg.twilioNumber);
+	if (!candidates.length) return cfg;
+	const profiles = await loadProfiles(env);
+	const hit = profiles.find((p) => p.number && candidates.includes(p.number));
+	return hit ? applyProfile(cfg, hit) : cfg;
+}
+
 // --- Twilio REST helpers -------------------------------------------------------
 
 function twilioAuth(sid: string, token: string) {
@@ -798,11 +848,12 @@ twin.get("/voice/audio/:id", async (c) => {
 // Required by FCC rules for AI-generated voice calls: the twin must identify
 // itself as an AI at the start of every call. Do not remove.
 twin.post("/voice/incoming", async (c) => {
-	const cfg = await loadCfg(c.env);
+	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
 	if (!(await validTwilioSignature(c.req.raw, voiceWebhookUrl(c.env), params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
+	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
 	const from = params.get("From") ?? "";
 	// Repeat callers get greeted like the twin remembers them — because it does.
 	const mem = await getCaller(c.env, from).catch(() => null);
@@ -825,11 +876,12 @@ twin.post("/voice/incoming", async (c) => {
 });
 
 twin.post("/voice/respond", async (c) => {
-	const cfg = await loadCfg(c.env);
+	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
 	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/voice/respond`, params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
+	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
 	const callSid = params.get("CallSid") ?? "unknown";
 	const heard = (params.get("SpeechResult") ?? "").trim();
 	if (!heard) return xml(gather(c.env, null, "Sorry, I didn't catch that. One more time?"));
@@ -996,11 +1048,12 @@ twin.get("/wire", async (c) => {
 // "text <number>: <message>" form still works. Anyone else's text is
 // forwarded to the owner's cell.
 twin.post("/sms/incoming", async (c) => {
-	const cfg = await loadCfg(c.env);
+	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
 	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/sms/incoming`, params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
+	cfg = await overlayProfile(c.env, cfg, [params.get("To")]);
 	const from = params.get("From") ?? "";
 	const body = (params.get("Body") ?? "").trim();
 	const send = (to: string, text: string) =>
@@ -1296,16 +1349,29 @@ twin.post(
 );
 
 // Have the twin call someone. It self-identifies as an AI at the start of the
-// call (FCC requirement) — only call people who expect it (TCPA).
+// call (FCC requirement) — only call people who expect it (TCPA). Pass
+// profileId to place the call as one of the extra twins (its number/persona).
 twin.post(
 	"/call",
 	ownerOnly,
-	zValidator("json", z.object({ to: z.string().regex(/^\+\d{8,15}$/, "Use E.164 format, e.g. +15551234567") })),
+	zValidator(
+		"json",
+		z.object({
+			to: z.string().regex(/^\+\d{8,15}$/, "Use E.164 format, e.g. +15551234567"),
+			profileId: z.string().optional(),
+		}),
+	),
 	async (c) => {
-		const cfg = await loadCfg(c.env);
+		let cfg = await loadCfg(c.env);
 		if (!cfg.twilioSid || !cfg.twilioToken) return c.json({ error: "twilio_not_connected" }, 400);
+		const { to, profileId } = c.req.valid("json");
+		if (profileId) {
+			const p = (await loadProfiles(c.env)).find((x) => x.id === profileId);
+			if (!p) return c.json({ error: "profile_not_found" }, 404);
+			if (!p.number) return c.json({ error: "no_number", message: "That twin has no phone number yet." }, 400);
+			cfg = applyProfile(cfg, p);
+		}
 		if (!cfg.twilioNumber) return c.json({ error: "no_number", message: "Pick a phone number first." }, 400);
-		const { to } = c.req.valid("json");
 		const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Calls.json", {
 			To: to,
 			From: cfg.twilioNumber,
@@ -1318,5 +1384,83 @@ twin.post(
 		return c.json({ ok: true, to });
 	},
 );
+
+// --- multiple twins (owner) ----------------------------------------------------
+
+twin.get("/profiles", ownerOnly, async (c) => {
+	const profiles = await loadProfiles(c.env);
+	return c.json({
+		profiles: profiles.map((p) => ({ id: p.id, name: p.name, persona: p.persona, number: p.number, voiceId: p.voice_id })),
+	});
+});
+
+// Create or update an extra twin. Attach a number either from the account
+// (numberSid) or by buying one (phoneNumber); its voice + SMS webhooks are
+// pointed at this worker, and inbound traffic routes to this twin's persona.
+twin.post(
+	"/profiles",
+	ownerOnly,
+	zValidator(
+		"json",
+		z.object({
+			id: z.string().optional(),
+			name: z.string().min(1).max(40),
+			persona: z.string().min(10).max(4000),
+			voiceId: z.string().min(4).optional(),
+			numberSid: z.string().regex(/^PN[a-f0-9]{32}$/i).optional(),
+			phoneNumber: z.string().regex(/^\+\d{8,15}$/).optional(),
+		}),
+	),
+	async (c) => {
+		const cfg = await loadCfg(c.env);
+		const { id, name, persona, voiceId, numberSid, phoneNumber } = c.req.valid("json");
+		if ((numberSid || phoneNumber) && (!cfg.twilioSid || !cfg.twilioToken)) {
+			return c.json({ error: "twilio_not_connected" }, 400);
+		}
+		let number: string | null = null;
+		if (numberSid || phoneNumber) {
+			const webhook = {
+				VoiceUrl: voiceWebhookUrl(c.env),
+				VoiceMethod: "POST",
+				SmsUrl: `${c.env.APP_URL}/api/twin/sms/incoming`,
+				SmsMethod: "POST",
+			};
+			const res = numberSid
+				? await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${numberSid}.json`, webhook)
+				: await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", { PhoneNumber: phoneNumber!, ...webhook });
+			if (!res.ok) {
+				const msg = (res.data as { message?: string }).message ?? "Twilio refused the request.";
+				return c.json({ error: "twilio_error", message: msg }, 502);
+			}
+			number = (res.data as { phone_number: string }).phone_number;
+			if (number === cfg.twilioNumber) {
+				return c.json({ error: "number_in_use", message: "That's the primary twin's number — pick a different one." }, 400);
+			}
+		}
+		const profileId = id ?? crypto.randomUUID();
+		try {
+			await c.env.DB
+				.prepare(
+					`INSERT INTO twin_profiles (id, name, persona, number, voice_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)
+					 ON CONFLICT(id) DO UPDATE SET name = excluded.name, persona = excluded.persona,
+						number = COALESCE(excluded.number, number), voice_id = COALESCE(excluded.voice_id, voice_id),
+						updated_at = excluded.updated_at`,
+				)
+				.bind(profileId, name, persona, number, voiceId ?? null, Date.now(), Date.now())
+				.run();
+		} catch {
+			return c.json({ error: "number_in_use", message: "Another twin already uses that number." }, 400);
+		}
+		return c.json({ ok: true, id: profileId, number });
+	},
+);
+
+// Remove an extra twin. Its Twilio number stays on the account (release it
+// from the Twilio console if it's no longer wanted).
+twin.delete("/profiles/:id", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	await c.env.DB.prepare("DELETE FROM twin_profiles WHERE id = ?").bind(c.req.param("id")).run();
+	return c.json({ ok: true });
+});
 
 export default twin;
