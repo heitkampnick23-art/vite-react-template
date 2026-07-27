@@ -382,6 +382,101 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 	return "idle";
 }
 
+// --- nightly digest ------------------------------------------------------------
+//
+// Once per local day, after TWIN_DIGEST_HOUR (default 9pm America/Chicago),
+// text the owner a Claude-written summary of everything the twin handled in
+// the last 24h. Idempotent — safe to call from cron, webhooks, and /wire; the
+// digest_last config key gates it to one send per day.
+
+export async function twinNightlyDigest(env: Env, force = false): Promise<string> {
+	if (!env.TWIN_NOTIFY_CELL) return "no notify cell configured";
+	const cfg = await loadCfg(env);
+	if (!cfg.twilioSid || !cfg.twilioToken || !cfg.twilioNumber) return "twilio not ready";
+
+	const tz = env.TWIN_TZ || "America/Chicago";
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: tz,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		hour12: false,
+	}).formatToParts(new Date());
+	const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+	const today = `${get("year")}-${get("month")}-${get("day")}`;
+	const hourNow = Number(get("hour"));
+	const digestHour = Number(env.TWIN_DIGEST_HOUR) || 21;
+
+	if (!force) {
+		if (hourNow < digestHour) return `before ${digestHour}:00 ${tz}`;
+		const last = await env.DB
+			.prepare("SELECT value FROM twin_config WHERE key = 'digest_last'")
+			.first<{ value: string }>();
+		if (last?.value === today) return "already sent today";
+	}
+
+	const since = Date.now() - 24 * 3600 * 1000;
+	const calls = await env.DB
+		.prepare("SELECT from_number, transcript, started_at FROM twin_calls WHERE started_at > ? ORDER BY started_at")
+		.bind(since)
+		.all<{ from_number: string | null; transcript: string; started_at: number }>();
+	const texts = await env.DB
+		.prepare("SELECT direction, peer_number, body, created_at FROM twin_texts WHERE created_at > ? ORDER BY created_at")
+		.bind(since)
+		.all<{ direction: string; peer_number: string; body: string; created_at: number }>();
+	const callRows = calls.results ?? [];
+	const textRows = texts.results ?? [];
+	if (!force && !callRows.length && !textRows.length) {
+		await dbSet(env, "digest_last", today);
+		return "no activity — skipped";
+	}
+
+	// Map numbers to names from contacts and caller memory.
+	const names = new Map<string, string>();
+	for (const k of await loadContacts(env)) names.set(k.phone, k.name);
+	const callers = await env.DB.prepare("SELECT phone, name FROM twin_callers WHERE name IS NOT NULL").all<{ phone: string; name: string }>();
+	for (const r of callers.results ?? []) if (!names.has(r.phone)) names.set(r.phone, r.name);
+	const who = (n: string | null) => (n ? names.get(n) ?? n : "unknown");
+
+	const fmtTime = (ts: number) =>
+		new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(new Date(ts));
+	const material = [
+		...callRows.map((r) => {
+			const turns = (JSON.parse(r.transcript) as Turn[])
+				.map((t) => `${t.role === "user" ? "Caller" : "Twin"}: ${t.content}`)
+				.join("\n");
+			return `CALL at ${fmtTime(r.started_at)} from ${who(r.from_number)}:\n${turns}`;
+		}),
+		...textRows.map(
+			(r) => `TEXT ${r.direction === "in" ? "from" : "to"} ${who(r.peer_number)} at ${fmtTime(r.created_at)}: ${r.body}`,
+		),
+	]
+		.join("\n---\n")
+		.slice(0, 12000);
+
+	const summary = callRows.length || textRows.length
+		? (await claude(
+				env,
+				`Write tonight's SMS digest for ${cfg.twinName} covering everything his AI phone twin handled today. ` +
+					`Plain text only, no markdown, max 550 characters. Lead with anything that needs his follow-up, ` +
+					`then one short line per call/conversation (who + gist). Use names, not numbers, where given.`,
+				[{ role: "user", content: material || "(no activity)" }],
+				400,
+			)) ?? null
+		: "Quiet day — your twin handled no calls or texts.";
+	if (!summary) return "summarization failed";
+
+	const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+		To: env.TWIN_NOTIFY_CELL,
+		From: cfg.twilioNumber,
+		Body: `🌙 Twin digest: ${summary}`.slice(0, 1500),
+	});
+	if (!res.ok) return `send failed: ${(res.data as { message?: string }).message ?? res.status}`;
+	await dbSet(env, "digest_last", today);
+	return "sent";
+}
+
 type TwinCfg = {
 	twilioSid: string;
 	twilioToken: string;
@@ -668,6 +763,7 @@ twin.post("/voice/incoming", async (c) => {
 		c.executionCtx.waitUntil(touchCaller(c.env, from).catch(() => {}));
 		c.executionCtx.waitUntil(refreshCallerSummary(c.env, from).catch(() => {}));
 	}
+	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	const audio = await speak(c.env, cfg, greeting);
 	return xml(gather(c.env, audio, greeting));
 });
@@ -759,6 +855,7 @@ twin.post("/voice/respond", async (c) => {
 // deploy pipeline after each deploy since the account's cron limit is full.
 twin.get("/wire", async (c) => {
 	const note = await twinAutoFinish(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
+	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	const cfg = await loadCfg(c.env);
 	let numbers: Array<{ phoneNumber: string; voiceUrl: string }> = [];
 	let accountType = "";
@@ -876,6 +973,7 @@ twin.post("/sms/incoming", async (c) => {
 		const known = contacts.find((k) => k.phone === from);
 		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${known ? `${known.name} (${from})` : from}: ${body.slice(0, 500)}`);
 	}
+	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	return c.body("<Response></Response>", 200, { "content-type": "text/xml" });
 });
 
@@ -905,6 +1003,20 @@ twin.delete("/contacts/:id", ownerOnly, async (c) => {
 	await ensureTable(c.env.DB);
 	await c.env.DB.prepare("DELETE FROM twin_contacts WHERE id = ?").bind(c.req.param("id")).run();
 	return c.json({ ok: true });
+});
+
+// Public, idempotent digest trigger (like /wire): sends at most one digest per
+// local day, only after the digest hour, and reveals nothing. Point any
+// external scheduler at this URL for a guaranteed nightly send.
+twin.get("/digest/run", async (c) => {
+	const note = await twinNightlyDigest(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
+	return c.json({ ok: true, note });
+});
+
+// Owner-only: send the digest right now regardless of the daily gate.
+twin.post("/digest/send", ownerOnly, async (c) => {
+	const note = await twinNightlyDigest(c.env, true).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
+	return c.json({ ok: note === "sent", note });
 });
 
 // Recent call transcripts for the owner.

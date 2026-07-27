@@ -24,6 +24,10 @@ declare namespace Cloudflare {
 		TWIN_VOICE_ID: string;
 		// Owner's cell for after-call SMS summaries (E.164).
 		TWIN_NOTIFY_CELL: string;
+		// Nightly digest: owner's IANA timezone (default America/Chicago) and the
+		// local hour after which the digest may send (default 21).
+		TWIN_TZ: string;
+		TWIN_DIGEST_HOUR: string;
 		// Phone-twin fallbacks — used only if not configured via the /twin page.
 		TWILIO_ACCOUNT_SID: string;
 		TWILIO_AUTH_TOKEN: string;
