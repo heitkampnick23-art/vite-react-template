@@ -47,21 +47,31 @@ const ownerOnly: MiddlewareHandler<AppEnv> = async (c, next) => {
 const SECRET_KEYS = new Set(["twilio_token", "eleven_key"]);
 
 async function ensureTable(db: D1Database) {
-	await db
-		.prepare(
+	await db.batch([
+		db.prepare(
 			`CREATE TABLE IF NOT EXISTS twin_config (
 				key TEXT PRIMARY KEY, value TEXT NOT NULL, iv TEXT, updated_at INTEGER NOT NULL
 			)`,
-		)
-		.run();
-	await db
-		.prepare(
+		),
+		db.prepare(
 			`CREATE TABLE IF NOT EXISTS twin_calls (
 				id TEXT PRIMARY KEY, from_number TEXT, transcript TEXT NOT NULL,
 				started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 			)`,
-		)
-		.run();
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_contacts (
+				id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, phone TEXT NOT NULL,
+				notes TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			)`,
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_texts (
+				id TEXT PRIMARY KEY, direction TEXT NOT NULL, peer_number TEXT NOT NULL,
+				body TEXT NOT NULL, created_at INTEGER NOT NULL
+			)`,
+		),
+	]);
 }
 
 // Persist the running transcript so the owner can read every conversation later.
@@ -72,6 +82,48 @@ async function saveTranscript(env: Env, callSid: string, from: string | null, hi
 			 ON CONFLICT(id) DO UPDATE SET transcript = excluded.transcript, updated_at = excluded.updated_at`,
 		)
 		.bind(callSid, from, JSON.stringify(history), Date.now(), Date.now())
+		.run();
+}
+
+// --- contacts + text log -------------------------------------------------------
+
+type Contact = { id: string; name: string; phone: string; notes: string | null };
+
+async function loadContacts(env: Env): Promise<Contact[]> {
+	await ensureTable(env.DB);
+	const rows = await env.DB
+		.prepare("SELECT id, name, phone, notes FROM twin_contacts ORDER BY name")
+		.all<Contact>();
+	return rows.results ?? [];
+}
+
+async function upsertContact(env: Env, name: string, phone: string, notes?: string) {
+	await ensureTable(env.DB);
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_contacts (id, name, phone, notes, created_at, updated_at) VALUES (?,?,?,?,?,?)
+			 ON CONFLICT(name) DO UPDATE SET phone = excluded.phone,
+				notes = COALESCE(excluded.notes, notes), updated_at = excluded.updated_at`,
+		)
+		.bind(crypto.randomUUID(), name.trim(), phone, notes ?? null, Date.now(), Date.now())
+		.run();
+}
+
+// Normalize a US-ish phone string to E.164; null if it doesn't look like one.
+function e164(raw: string): string | null {
+	let d = raw.replace(/\D/g, "");
+	if (d.length === 10) d = "1" + d;
+	if (d.length < 8 || d.length > 15) return null;
+	return "+" + d;
+}
+
+// Keep a log of real conversations (not owner↔twin control traffic) so the
+// nightly digest and the dashboard can show them.
+async function logText(env: Env, direction: "in" | "out", peer: string, body: string) {
+	if (!peer || peer === env.TWIN_NOTIFY_CELL) return;
+	await env.DB
+		.prepare("INSERT INTO twin_texts (id, direction, peer_number, body, created_at) VALUES (?,?,?,?,?)")
+		.bind(crypto.randomUUID(), direction, peer, body, Date.now())
 		.run();
 }
 
@@ -349,7 +401,7 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 
 type Turn = { role: "user" | "assistant"; content: string };
 
-async function personaReply(env: Env, cfg: TwinCfg, history: Turn[]): Promise<string> {
+async function claude(env: Env, system: string, messages: Turn[], maxTokens = 300): Promise<string | null> {
 	const res = await fetch("https://api.anthropic.com/v1/messages", {
 		method: "POST",
 		headers: {
@@ -357,18 +409,90 @@ async function personaReply(env: Env, cfg: TwinCfg, history: Turn[]): Promise<st
 			"anthropic-version": "2023-06-01",
 			"content-type": "application/json",
 		},
-		body: JSON.stringify({
-			model: "claude-haiku-4-5-20251001",
-			max_tokens: 200,
-			system:
-				cfg.persona +
-				" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
-			messages: history,
-		}),
+		body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: maxTokens, system, messages }),
 	});
-	if (!res.ok) return "Sorry, I glitched for a second there. Say that again?";
+	if (!res.ok) return null;
 	const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
-	return data.content?.find((b) => b.type === "text")?.text?.trim() || "Sorry, say that again?";
+	return data.content?.find((b) => b.type === "text")?.text?.trim() || null;
+}
+
+async function personaReply(env: Env, cfg: TwinCfg, history: Turn[]): Promise<string> {
+	const reply = await claude(
+		env,
+		cfg.persona +
+			" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
+		history,
+		200,
+	);
+	return reply ?? "Sorry, I glitched for a second there. Say that again?";
+}
+
+// --- smart texting: owner texts the twin in plain English ----------------------
+//
+// "tell Jake I'll be there at 6" → looks Jake up in contacts, writes the text
+// the way the owner would, sends it from the twin's number, confirms back.
+
+type OwnerSmsAction =
+	| { action: "send"; to?: string; toName?: string; message?: string }
+	| { action: "add_contact"; name?: string; phone?: string }
+	| { action: "reply"; reply?: string };
+
+function parseAction(raw: string | null): OwnerSmsAction | null {
+	if (!raw) return null;
+	const m = raw.match(/\{[\s\S]*\}/); // tolerate prose or code fences around the JSON
+	if (!m) return null;
+	try {
+		return JSON.parse(m[0]) as OwnerSmsAction;
+	} catch {
+		return null;
+	}
+}
+
+// Interpret an owner text and perform it. Returns the confirmation to text back.
+async function smartOwnerSms(env: Env, cfg: TwinCfg, body: string): Promise<string> {
+	const contacts = await loadContacts(env);
+	const send = (to: string, text: string) =>
+		twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", { To: to, From: cfg.twilioNumber, Body: text });
+
+	const system =
+		`You are the SMS command interpreter for ${cfg.twinName}'s AI phone twin. ` +
+		`${cfg.twinName} (the owner) just texted the twin's number; work out what they want and respond with ONLY one JSON object, no other text.\n` +
+		`Contacts:\n${contacts.map((c) => `- ${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n") || "(none yet)"}\n` +
+		`Actions:\n` +
+		`1. Relay a message to someone — {"action":"send","to":"+15551234567","toName":"Jake","message":"..."}. ` +
+		`Resolve "to" from the contacts above or from a phone number written in the text. ` +
+		`Write "message" exactly as ${cfg.twinName} would text it: first person, casual, brief, no signature. ` +
+		`Since it comes from the twin's number, open with a short identifier like "It's ${cfg.twinName} — " unless the text already makes that obvious.\n` +
+		`2. Save a contact — {"action":"add_contact","name":"Jake","phone":"+15551234567"}.\n` +
+		`3. Anything else (question, chat, unknown contact, ambiguous) — {"action":"reply","reply":"..."} with a short SMS answer. ` +
+		`If they want to message someone who isn't in contacts and gave no number, say you don't have that person yet and to text: add <name> <number>.\n` +
+		`Owner's persona, for message style: ${cfg.persona.slice(0, 600)}`;
+
+	const act = parseAction(await claude(env, system, [{ role: "user", content: body }], 400));
+	if (!act) return "Hmm, I couldn't process that. Try: \"tell Jake I'll be there at 6\" or \"add Jake 9525551234\".";
+
+	if (act.action === "add_contact") {
+		const phone = act.phone ? e164(act.phone) : null;
+		if (!act.name || !phone) return 'To save a contact, text: "add Jake 9525551234".';
+		await upsertContact(env, act.name, phone);
+		return `Saved ${act.name} → ${phone}.`;
+	}
+	if (act.action === "send") {
+		const to = act.to ? e164(act.to) : null;
+		if (!to || !act.message) {
+			return act.toName
+				? `I don't have a number for ${act.toName}. Text: "add ${act.toName} 9525551234" and I'll remember them.`
+				: "I couldn't figure out who to text. Include a name from contacts or a phone number.";
+		}
+		const res = await send(to, act.message);
+		if (!res.ok) {
+			const msg = (res.data as { message?: string }).message ?? `error ${res.status}`;
+			return `Couldn't send to ${act.toName ?? to}: ${msg}`;
+		}
+		await logText(env, "out", to, act.message);
+		return `Texted ${act.toName ?? to}${act.toName ? ` (${to})` : ""}: "${act.message}"`;
+	}
+	return act.reply || 'I can relay texts ("tell Jake I\'ll be there at 6") and save contacts ("add Jake 9525551234").';
 }
 
 async function loadConvo(env: Env, callSid: string): Promise<Turn[]> {
@@ -592,8 +716,10 @@ twin.get("/wire", async (c) => {
 	});
 });
 
-// Inbound SMS to the twin's number. Owner texts "text <number>: <message>"
-// and the twin relays it from its own number; anyone else's text is
+// Inbound SMS to the twin's number. The owner texts it in plain English —
+// "tell Jake I'll be there at 6" resolves the contact and writes the message
+// in the owner's style; "add Jake 9525551234" saves a contact; the explicit
+// "text <number>: <message>" form still works. Anyone else's text is
 // forwarded to the owner's cell.
 twin.post("/sms/incoming", async (c) => {
 	const cfg = await loadCfg(c.env);
@@ -606,19 +732,59 @@ twin.post("/sms/incoming", async (c) => {
 	const send = (to: string, text: string) =>
 		twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", { To: to, From: cfg.twilioNumber, Body: text });
 	if (from === c.env.TWIN_NOTIFY_CELL) {
-		const m = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
-		if (m) {
-			let to = m[1].replace(/\D/g, "");
-			if (to.length === 10) to = "1" + to;
-			await send("+" + to, m[2].trim());
-			await send(from, `Sent to +${to}.`);
-		} else {
-			await send(from, 'To relay a text: "text 9525551234: your message"');
+		// Deterministic fast paths first; Claude handles everything else.
+		const explicit = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
+		const addCmd = body.match(/^(?:add|save)(?:\s+contact)?\s+(.{1,40}?)\s+(\+?[\d\s().-]{10,16})$/i);
+		if (explicit) {
+			const to = e164(explicit[1]);
+			if (to) {
+				await send(to, explicit[2].trim());
+				await logText(c.env, "out", to, explicit[2].trim());
+				await send(from, `Sent to ${to}.`);
+			} else {
+				await send(from, "That number doesn't look right — use 10 digits or +E.164.");
+			}
+		} else if (addCmd && e164(addCmd[2])) {
+			await upsertContact(c.env, addCmd[1], e164(addCmd[2])!);
+			await send(from, `Saved ${addCmd[1].trim()} → ${e164(addCmd[2])}.`);
+		} else if (body) {
+			await send(from, await smartOwnerSms(c.env, cfg, body));
 		}
 	} else if (c.env.TWIN_NOTIFY_CELL) {
-		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${from}: ${body.slice(0, 500)}`);
+		await logText(c.env, "in", from, body);
+		const contacts = await loadContacts(c.env);
+		const known = contacts.find((k) => k.phone === from);
+		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${known ? `${known.name} (${from})` : from}: ${body.slice(0, 500)}`);
 	}
 	return c.body("<Response></Response>", 200, { "content-type": "text/xml" });
+});
+
+// --- contacts (owner) ----------------------------------------------------------
+
+twin.get("/contacts", ownerOnly, async (c) => {
+	return c.json({ contacts: await loadContacts(c.env) });
+});
+
+twin.post(
+	"/contacts",
+	ownerOnly,
+	zValidator(
+		"json",
+		z.object({ name: z.string().min(1).max(60), phone: z.string().min(7).max(20), notes: z.string().max(200).optional() }),
+	),
+	async (c) => {
+		const { name, phone, notes } = c.req.valid("json");
+		const normalized = e164(phone);
+		if (!normalized) return c.json({ error: "bad_phone", message: "Use a 10-digit US number or +E.164." }, 400);
+		await upsertContact(c.env, name, normalized, notes);
+		return c.json({ ok: true, phone: normalized });
+	},
+);
+
+twin.delete("/contacts/:id", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	await c.env.DB.prepare("DELETE FROM twin_contacts WHERE id = ?").bind(c.req.param("id")).run();
+	return c.json({ ok: true });
 });
 
 // Recent call transcripts for the owner.

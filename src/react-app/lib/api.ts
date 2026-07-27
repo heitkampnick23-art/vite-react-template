@@ -77,6 +77,10 @@ export const api = {
 		req<{ calls: Array<{ id: string; from: string | null; startedAt: number; turns: Array<{ role: "user" | "assistant"; content: string }> }> }>(
 			"/api/twin/calls",
 		),
+	twinContacts: () => req<{ contacts: TwinContact[] }>("/api/twin/contacts"),
+	twinAddContact: (body: { name: string; phone: string; notes?: string }) =>
+		req<{ ok: true; phone: string }>("/api/twin/contacts", { method: "POST", body: JSON.stringify(body) }),
+	twinDeleteContact: (id: string) => req<{ ok: true }>(`/api/twin/contacts/${id}`, { method: "DELETE" }),
 };
 
 export type TwinStatus = {
@@ -89,6 +93,7 @@ export type TwinStatus = {
 };
 export type TwinOwnedNumber = { sid: string; phoneNumber: string; name: string; voiceUrl?: string };
 export type TwinVoice = { id: string; name: string; category: string };
+export type TwinContact = { id: string; name: string; phone: string; notes: string | null };
 
 // SSE helper for AI chat.
 export async function* streamChat(body: {

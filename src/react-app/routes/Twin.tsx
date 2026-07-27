@@ -8,7 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type TwinOwnedNumber, type TwinVoice } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { CheckCircle2, Circle, Phone, PhoneOutgoing, Mic2, Sparkles } from "lucide-react";
+import { CheckCircle2, Circle, MessageSquare, Phone, PhoneOutgoing, Mic2, Sparkles, X } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -47,6 +47,8 @@ export function Twin() {
 	const [persona, setPersona] = useState<string | null>(null);
 	const [callTo, setCallTo] = useState("");
 	const [callResult, setCallResult] = useState("");
+	const [contactName, setContactName] = useState("");
+	const [contactPhone, setContactPhone] = useState("");
 
 	const refresh = () => qc.invalidateQueries({ queryKey: ["twin-status"] });
 
@@ -88,6 +90,19 @@ export function Twin() {
 		mutationFn: () => api.twinCall(callTo.trim()),
 		onSuccess: (d) => setCallResult(`Calling ${d.to} now — pick up and say hi to your twin.`),
 		onError: (e) => setCallResult(errMsg(e)),
+	});
+	const contacts = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
+	const addContact = useMutation({
+		mutationFn: () => api.twinAddContact({ name: contactName.trim(), phone: contactPhone.trim() }),
+		onSuccess: () => {
+			setContactName("");
+			setContactPhone("");
+			qc.invalidateQueries({ queryKey: ["twin-contacts"] });
+		},
+	});
+	const deleteContact = useMutation({
+		mutationFn: (id: string) => api.twinDeleteContact(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-contacts"] }),
 	});
 
 	if (status.isLoading) {
@@ -292,6 +307,40 @@ export function Twin() {
 					</Button>
 				</div>
 				{callResult && <div className="mt-2 text-xs text-zinc-400">{callResult}</div>}
+			</Card>
+
+			{/* Smart texting + contacts */}
+			<Card className="mt-4">
+				<div className="flex items-center gap-2 font-semibold">
+					<MessageSquare className="h-4 w-4" /> Smart texting &amp; contacts
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Text your twin's number in plain English — <i>"tell Jake I'll be there at 6"</i> — and it figures out who you
+					mean, writes the text in your style, and sends it. Save people here or by texting{" "}
+					<i>"add Jake 9525551234"</i> to the twin.
+				</p>
+				<div className="mt-3 flex gap-2">
+					<input className={inputCls + " max-w-44"} placeholder="Name" value={contactName} onChange={(e) => setContactName(e.target.value)} />
+					<input className={inputCls + " max-w-48"} placeholder="9525551234" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} />
+					<Button size="sm" disabled={!contactName.trim() || !contactPhone.trim() || addContact.isPending} onClick={() => addContact.mutate()}>
+						{addContact.isPending ? "Saving…" : "Add"}
+					</Button>
+				</div>
+				{addContact.isError && <div className="mt-1 text-xs text-red-400">{errMsg(addContact.error)}</div>}
+				{contacts.data?.contacts.length === 0 && (
+					<div className="mt-3 text-sm text-zinc-500">No contacts yet.</div>
+				)}
+				{contacts.data?.contacts.map((k) => (
+					<div key={k.id} className="flex items-center justify-between border-b border-white/5 py-2 text-sm last:border-0">
+						<span>
+							{k.name} <span className="ml-2 tabular-nums text-xs text-zinc-500">{k.phone}</span>
+							{k.notes && <span className="ml-2 text-xs text-zinc-600">{k.notes}</span>}
+						</span>
+						<button className="text-zinc-600 hover:text-red-400" title="Remove" onClick={() => deleteContact.mutate(k.id)}>
+							<X className="h-4 w-4" />
+						</button>
+					</div>
+				))}
 			</Card>
 
 			{/* Transcripts */}
