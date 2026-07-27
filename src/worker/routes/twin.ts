@@ -78,6 +78,11 @@ async function ensureTable(db: D1Database) {
 				summarized_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
 			)`,
 		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_facts (
+				id TEXT PRIMARY KEY, fact TEXT NOT NULL, created_at INTEGER NOT NULL
+			)`,
+		),
 	]);
 }
 
@@ -132,6 +137,40 @@ async function logText(env: Env, direction: "in" | "out", peer: string, body: st
 		.prepare("INSERT INTO twin_texts (id, direction, peer_number, body, created_at) VALUES (?,?,?,?,?)")
 		.bind(crypto.randomUUID(), direction, peer, body, Date.now())
 		.run();
+}
+
+// --- "facts about the owner" memory --------------------------------------------
+//
+// Short owner-curated facts ("my address is …", "I'm out of town till Friday")
+// the twin injects into every conversation so it can answer real questions.
+
+type Fact = { id: string; fact: string; created_at: number };
+
+async function loadFacts(env: Env): Promise<Fact[]> {
+	await ensureTable(env.DB);
+	const rows = await env.DB
+		.prepare("SELECT id, fact, created_at FROM twin_facts ORDER BY created_at DESC LIMIT 60")
+		.all<Fact>();
+	return rows.results ?? [];
+}
+
+async function addFact(env: Env, fact: string) {
+	await ensureTable(env.DB);
+	await env.DB
+		.prepare("INSERT INTO twin_facts (id, fact, created_at) VALUES (?,?,?)")
+		.bind(crypto.randomUUID(), fact.trim().slice(0, 500), Date.now())
+		.run();
+}
+
+// System-prompt block, capped so a long fact list can't crowd out the persona.
+function factsBlock(twinName: string, facts: Fact[]): string {
+	if (!facts.length) return "";
+	let block = "";
+	for (const f of facts) {
+		if (block.length + f.fact.length > 3000) break;
+		block += `\n- ${f.fact}`;
+	}
+	return ` Things you know about ${twinName} (use them to answer questions; don't volunteer private-sounding details unprompted):${block}`;
 }
 
 // --- caller memory -------------------------------------------------------------
@@ -634,6 +673,8 @@ async function personaReply(env: Env, cfg: TwinCfg, history: Turn[], extraContex
 type OwnerSmsAction =
 	| { action: "send"; to?: string; toName?: string; message?: string }
 	| { action: "add_contact"; name?: string; phone?: string }
+	| { action: "remember"; fact?: string }
+	| { action: "forget"; id?: string }
 	| { action: "reply"; reply?: string };
 
 function parseAction(raw: string | null): OwnerSmsAction | null {
@@ -650,6 +691,7 @@ function parseAction(raw: string | null): OwnerSmsAction | null {
 // Interpret an owner text and perform it. Returns the confirmation to text back.
 async function smartOwnerSms(env: Env, cfg: TwinCfg, body: string): Promise<string> {
 	const contacts = await loadContacts(env);
+	const facts = await loadFacts(env);
 	const send = (to: string, text: string) =>
 		twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", { To: to, From: cfg.twilioNumber, Body: text });
 
@@ -657,19 +699,33 @@ async function smartOwnerSms(env: Env, cfg: TwinCfg, body: string): Promise<stri
 		`You are the SMS command interpreter for ${cfg.twinName}'s AI phone twin. ` +
 		`${cfg.twinName} (the owner) just texted the twin's number; work out what they want and respond with ONLY one JSON object, no other text.\n` +
 		`Contacts:\n${contacts.map((c) => `- ${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n") || "(none yet)"}\n` +
+		`Stored facts about ${cfg.twinName} (id: fact):\n${facts.map((f) => `- ${f.id.slice(0, 8)}: ${f.fact}`).join("\n") || "(none yet)"}\n` +
 		`Actions:\n` +
 		`1. Relay a message to someone — {"action":"send","to":"+15551234567","toName":"Jake","message":"..."}. ` +
 		`Resolve "to" from the contacts above or from a phone number written in the text. ` +
 		`Write "message" exactly as ${cfg.twinName} would text it: first person, casual, brief, no signature. ` +
 		`Since it comes from the twin's number, open with a short identifier like "It's ${cfg.twinName} — " unless the text already makes that obvious.\n` +
 		`2. Save a contact — {"action":"add_contact","name":"Jake","phone":"+15551234567"}.\n` +
-		`3. Anything else (question, chat, unknown contact, ambiguous) — {"action":"reply","reply":"..."} with a short SMS answer. ` +
+		`3. Remember a fact for future calls/texts ("remember I moved to unit 4B") — {"action":"remember","fact":"..."} with the fact rewritten as a clean standalone statement.\n` +
+		`4. Forget a stored fact — {"action":"forget","id":"<8-char id from the list>"}.\n` +
+		`5. Anything else (question, chat, unknown contact, ambiguous) — {"action":"reply","reply":"..."} with a short SMS answer, using the stored facts when relevant. ` +
 		`If they want to message someone who isn't in contacts and gave no number, say you don't have that person yet and to text: add <name> <number>.\n` +
 		`Owner's persona, for message style: ${cfg.persona.slice(0, 600)}`;
 
 	const act = parseAction(await claude(env, system, [{ role: "user", content: body }], 400));
 	if (!act) return "Hmm, I couldn't process that. Try: \"tell Jake I'll be there at 6\" or \"add Jake 9525551234\".";
 
+	if (act.action === "remember") {
+		if (!act.fact) return 'To store a fact, text: "remember <the fact>".';
+		await addFact(env, act.fact);
+		return `Got it, I'll remember: ${act.fact}`;
+	}
+	if (act.action === "forget") {
+		const hit = act.id ? facts.find((f) => f.id.startsWith(act.id!)) : undefined;
+		if (!hit) return "I couldn't tell which fact to forget — check the list on the /twin page.";
+		await env.DB.prepare("DELETE FROM twin_facts WHERE id = ?").bind(hit.id).run();
+		return `Forgotten: ${hit.fact}`;
+	}
 	if (act.action === "add_contact") {
 		const phone = act.phone ? e164(act.phone) : null;
 		if (!act.name || !phone) return 'To save a contact, text: "add Jake 9525551234".';
@@ -819,7 +875,8 @@ twin.post("/voice/respond", async (c) => {
 	}
 
 	const mem = await getCaller(c.env, params.get("From") ?? "").catch(() => null);
-	const reply = await personaReply(c.env, cfg, history, callerContext(mem));
+	const facts = await loadFacts(c.env).catch(() => [] as Fact[]);
+	const reply = await personaReply(c.env, cfg, history, factsBlock(cfg.twinName, facts) + callerContext(mem));
 	history.push({ role: "assistant", content: reply });
 	await saveConvo(c.env, callSid, history);
 	await saveTranscript(c.env, callSid, params.get("From"), history);
@@ -952,7 +1009,11 @@ twin.post("/sms/incoming", async (c) => {
 		// Deterministic fast paths first; Claude handles everything else.
 		const explicit = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
 		const addCmd = body.match(/^(?:add|save)(?:\s+contact)?\s+(.{1,40}?)\s+(\+?[\d\s().-]{10,16})$/i);
-		if (explicit) {
+		const rememberCmd = body.match(/^remember[:,]?\s+([\s\S]{3,})$/i);
+		if (rememberCmd) {
+			await addFact(c.env, rememberCmd[1].trim());
+			await send(from, `Got it, I'll remember: ${rememberCmd[1].trim().slice(0, 300)}`);
+		} else if (explicit) {
 			const to = e164(explicit[1]);
 			if (to) {
 				await send(to, explicit[2].trim());
@@ -975,6 +1036,23 @@ twin.post("/sms/incoming", async (c) => {
 	}
 	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	return c.body("<Response></Response>", 200, { "content-type": "text/xml" });
+});
+
+// --- facts (owner) -------------------------------------------------------------
+
+twin.get("/facts", ownerOnly, async (c) => {
+	return c.json({ facts: await loadFacts(c.env) });
+});
+
+twin.post("/facts", ownerOnly, zValidator("json", z.object({ fact: z.string().min(3).max(500) })), async (c) => {
+	await addFact(c.env, c.req.valid("json").fact);
+	return c.json({ ok: true });
+});
+
+twin.delete("/facts/:id", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	await c.env.DB.prepare("DELETE FROM twin_facts WHERE id = ?").bind(c.req.param("id")).run();
+	return c.json({ ok: true });
 });
 
 // --- contacts (owner) ----------------------------------------------------------

@@ -8,7 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type TwinOwnedNumber, type TwinVoice } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { CheckCircle2, Circle, MessageSquare, Phone, PhoneForwarded, PhoneOutgoing, Mic2, Sparkles, X } from "lucide-react";
+import { Brain, CheckCircle2, Circle, MessageSquare, Phone, PhoneForwarded, PhoneOutgoing, Mic2, Sparkles, X } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -49,6 +49,7 @@ export function Twin() {
 	const [callResult, setCallResult] = useState("");
 	const [contactName, setContactName] = useState("");
 	const [contactPhone, setContactPhone] = useState("");
+	const [newFact, setNewFact] = useState("");
 
 	const refresh = () => qc.invalidateQueries({ queryKey: ["twin-status"] });
 
@@ -93,6 +94,18 @@ export function Twin() {
 	});
 	const contacts = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
 	const forwarding = useQuery({ queryKey: ["twin-forwarding"], queryFn: api.twinForwarding, retry: false });
+	const facts = useQuery({ queryKey: ["twin-facts"], queryFn: api.twinFacts, retry: false });
+	const addFact = useMutation({
+		mutationFn: () => api.twinAddFact(newFact.trim()),
+		onSuccess: () => {
+			setNewFact("");
+			qc.invalidateQueries({ queryKey: ["twin-facts"] });
+		},
+	});
+	const deleteFact = useMutation({
+		mutationFn: (id: string) => api.twinDeleteFact(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-facts"] }),
+	});
 	const addContact = useMutation({
 		mutationFn: () => api.twinAddContact({ name: contactName.trim(), phone: contactPhone.trim() }),
 		onSuccess: () => {
@@ -338,6 +351,39 @@ export function Twin() {
 							{k.notes && <span className="ml-2 text-xs text-zinc-600">{k.notes}</span>}
 						</span>
 						<button className="text-zinc-600 hover:text-red-400" title="Remove" onClick={() => deleteContact.mutate(k.id)}>
+							<X className="h-4 w-4" />
+						</button>
+					</div>
+				))}
+			</Card>
+
+			{/* Facts memory */}
+			<Card className="mt-4">
+				<div className="flex items-center gap-2 font-semibold">
+					<Brain className="h-4 w-4" /> Facts about you
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Things your twin knows and uses to answer real questions on calls and texts. Add them here or text the twin{" "}
+					<i>"remember I'm out of town until Friday"</i>.
+				</p>
+				<div className="mt-3 flex gap-2">
+					<input
+						className={inputCls}
+						placeholder="e.g. The garage code for deliveries is 4482"
+						value={newFact}
+						onChange={(e) => setNewFact(e.target.value)}
+						onKeyDown={(e) => e.key === "Enter" && newFact.trim().length >= 3 && addFact.mutate()}
+					/>
+					<Button size="sm" disabled={newFact.trim().length < 3 || addFact.isPending} onClick={() => addFact.mutate()}>
+						{addFact.isPending ? "Saving…" : "Add"}
+					</Button>
+				</div>
+				{addFact.isError && <div className="mt-1 text-xs text-red-400">{errMsg(addFact.error)}</div>}
+				{facts.data?.facts.length === 0 && <div className="mt-3 text-sm text-zinc-500">Nothing yet — the twin only knows its persona.</div>}
+				{facts.data?.facts.map((f) => (
+					<div key={f.id} className="flex items-center justify-between border-b border-white/5 py-2 text-sm last:border-0">
+						<span>{f.fact}</span>
+						<button className="ml-3 shrink-0 text-zinc-600 hover:text-red-400" title="Forget" onClick={() => deleteFact.mutate(f.id)}>
 							<X className="h-4 w-4" />
 						</button>
 					</div>

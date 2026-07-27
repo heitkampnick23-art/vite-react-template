@@ -82,6 +82,9 @@ export const api = {
 		req<{ ok: true; phone: string }>("/api/twin/contacts", { method: "POST", body: JSON.stringify(body) }),
 	twinDeleteContact: (id: string) => req<{ ok: true }>(`/api/twin/contacts/${id}`, { method: "DELETE" }),
 	twinForwarding: () => req<TwinForwarding>("/api/twin/forwarding"),
+	twinFacts: () => req<{ facts: TwinFact[] }>("/api/twin/facts"),
+	twinAddFact: (fact: string) => req<{ ok: true }>("/api/twin/facts", { method: "POST", body: JSON.stringify({ fact }) }),
+	twinDeleteFact: (id: string) => req<{ ok: true }>(`/api/twin/facts/${id}`, { method: "DELETE" }),
 };
 
 export type TwinStatus = {
@@ -95,6 +98,7 @@ export type TwinStatus = {
 export type TwinOwnedNumber = { sid: string; phoneNumber: string; name: string; voiceUrl?: string };
 export type TwinVoice = { id: string; name: string; category: string };
 export type TwinContact = { id: string; name: string; phone: string; notes: string | null };
+export type TwinFact = { id: string; fact: string; created_at: number };
 export type TwinForwarding = {
 	number: string;
 	carriers: Array<{ carrier: string; activate: Array<{ label: string; code: string }>; deactivate: string }>;
