@@ -71,6 +71,13 @@ async function ensureTable(db: D1Database) {
 				body TEXT NOT NULL, created_at INTEGER NOT NULL
 			)`,
 		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_callers (
+				phone TEXT PRIMARY KEY, name TEXT, summary TEXT NOT NULL DEFAULT '',
+				call_count INTEGER NOT NULL DEFAULT 0, last_call_at INTEGER,
+				summarized_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+			)`,
+		),
 	]);
 }
 
@@ -125,6 +132,102 @@ async function logText(env: Env, direction: "in" | "out", peer: string, body: st
 		.prepare("INSERT INTO twin_texts (id, direction, peer_number, body, created_at) VALUES (?,?,?,?,?)")
 		.bind(crypto.randomUUID(), direction, peer, body, Date.now())
 		.run();
+}
+
+// --- caller memory -------------------------------------------------------------
+//
+// One row per phone number: how many times they've called, and a rolling
+// Claude-written summary of past transcripts so the twin can greet repeat
+// callers like it remembers them (it does).
+
+type CallerMemory = {
+	phone: string;
+	name: string | null;
+	summary: string;
+	call_count: number;
+	last_call_at: number | null;
+	summarized_at: number;
+};
+
+async function getCaller(env: Env, phone: string): Promise<CallerMemory | null> {
+	if (!phone) return null;
+	return await env.DB
+		.prepare("SELECT phone, name, summary, call_count, last_call_at, summarized_at FROM twin_callers WHERE phone = ?")
+		.bind(phone)
+		.first<CallerMemory>();
+}
+
+// Count a new call and fill in the name from contacts if we have it.
+async function touchCaller(env: Env, phone: string) {
+	const contact = (await loadContacts(env)).find((k) => k.phone === phone);
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_callers (phone, name, call_count, last_call_at, updated_at) VALUES (?,?,1,?,?)
+			 ON CONFLICT(phone) DO UPDATE SET call_count = call_count + 1, last_call_at = excluded.last_call_at,
+				name = COALESCE(name, excluded.name), updated_at = excluded.updated_at`,
+		)
+		.bind(phone, contact?.name ?? null, Date.now(), Date.now())
+		.run();
+}
+
+// Fold any transcripts newer than the stored summary into it (runs in
+// waitUntil — never on the caller's clock).
+async function refreshCallerSummary(env: Env, phone: string) {
+	if (!phone) return;
+	const row = await getCaller(env, phone);
+	const since = row?.summarized_at ?? 0;
+	const calls = await env.DB
+		.prepare(
+			"SELECT transcript FROM twin_calls WHERE from_number = ? AND updated_at > ? ORDER BY started_at DESC LIMIT 5",
+		)
+		.bind(phone, since)
+		.all<{ transcript: string }>();
+	const fresh = calls.results ?? [];
+	if (!fresh.length) return;
+	const transcripts = fresh
+		.map((r) => (JSON.parse(r.transcript) as Turn[]).map((t) => `${t.role === "user" ? "Caller" : "Twin"}: ${t.content}`).join("\n"))
+		.join("\n---\n")
+		.slice(0, 8000);
+	const raw = await claude(
+		env,
+		`You maintain the caller-memory file for an AI phone twin. Merge the existing memory with the new call transcripts into an updated memory. ` +
+			`Respond with ONLY JSON: {"name": "<caller's first name if they said or confirmed it, else null>", "summary": "<max 500 chars: who they are, what they've called about, anything promised or unresolved>"}`,
+		[
+			{
+				role: "user",
+				content: `Existing memory${row?.name ? ` (name: ${row.name})` : ""}: ${row?.summary || "(none)"}\n\nNew transcripts:\n${transcripts}`,
+			},
+		],
+		400,
+	);
+	const m = raw?.match(/\{[\s\S]*\}/);
+	if (!m) return;
+	let parsed: { name?: string | null; summary?: string };
+	try {
+		parsed = JSON.parse(m[0]) as { name?: string | null; summary?: string };
+	} catch {
+		return;
+	}
+	if (!parsed.summary) return;
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_callers (phone, name, summary, summarized_at, updated_at) VALUES (?,?,?,?,?)
+			 ON CONFLICT(phone) DO UPDATE SET summary = excluded.summary, name = COALESCE(excluded.name, name),
+				summarized_at = excluded.summarized_at, updated_at = excluded.updated_at`,
+		)
+		.bind(phone, parsed.name ?? null, parsed.summary.slice(0, 600), Date.now(), Date.now())
+		.run();
+}
+
+// Extra system-prompt context for a call from a known number.
+function callerContext(mem: CallerMemory | null): string {
+	if (!mem || (!mem.summary && !mem.name)) return "";
+	return (
+		` This caller has phoned ${mem.call_count} time(s) before.` +
+		(mem.name ? ` Their name is ${mem.name}.` : "") +
+		(mem.summary ? ` What you remember about them from past calls: ${mem.summary}` : "") +
+		" Use this memory naturally — don't recite it."
+	);
 }
 
 async function dbSet(env: Env, key: string, value: string) {
@@ -416,10 +519,11 @@ async function claude(env: Env, system: string, messages: Turn[], maxTokens = 30
 	return data.content?.find((b) => b.type === "text")?.text?.trim() || null;
 }
 
-async function personaReply(env: Env, cfg: TwinCfg, history: Turn[]): Promise<string> {
+async function personaReply(env: Env, cfg: TwinCfg, history: Turn[], extraContext = ""): Promise<string> {
 	const reply = await claude(
 		env,
 		cfg.persona +
+			extraContext +
 			" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
 		history,
 		200,
@@ -548,10 +652,22 @@ twin.post("/voice/incoming", async (c) => {
 	if (!(await validTwilioSignature(c.req.raw, voiceWebhookUrl(c.env), params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
-	const greeting = `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
+	const from = params.get("From") ?? "";
+	// Repeat callers get greeted like the twin remembers them — because it does.
+	const mem = await getCaller(c.env, from).catch(() => null);
+	const greeting =
+		mem && mem.call_count > 0
+			? `Hey${mem.name ? ` ${mem.name}` : ""}, it's ${cfg.twinName}'s AI twin again — good to hear from you. What's up?`
+			: `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
 	const callSid = params.get("CallSid") ?? "unknown";
 	await saveConvo(c.env, callSid, [{ role: "assistant", content: greeting }]);
 	await saveTranscript(c.env, callSid, params.get("From"), [{ role: "assistant", content: greeting }]);
+	if (from) {
+		// Count the call and fold any not-yet-summarized past transcripts into
+		// memory (helps the /respond turns of this very call, and the next one).
+		c.executionCtx.waitUntil(touchCaller(c.env, from).catch(() => {}));
+		c.executionCtx.waitUntil(refreshCallerSummary(c.env, from).catch(() => {}));
+	}
 	const audio = await speak(c.env, cfg, greeting);
 	return xml(gather(c.env, audio, greeting));
 });
@@ -606,16 +722,20 @@ twin.post("/voice/respond", async (c) => {
 		);
 	}
 
-	const reply = await personaReply(c.env, cfg, history);
+	const mem = await getCaller(c.env, params.get("From") ?? "").catch(() => null);
+	const reply = await personaReply(c.env, cfg, history, callerContext(mem));
 	history.push({ role: "assistant", content: reply });
 	await saveConvo(c.env, callSid, history);
 	await saveTranscript(c.env, callSid, params.get("From"), history);
 
 	const audio = await speak(c.env, cfg, reply);
 	if (/\b(goodbye|bye|talk later|hang up)\b/i.test(heard)) {
+		// Fold this finished call into the caller's memory right away.
+		const caller = params.get("From");
+		if (caller) c.executionCtx.waitUntil(refreshCallerSummary(c.env, caller).catch(() => {}));
 		// Text the owner a summary of the finished call.
 		if (c.env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
-			const from = params.get("From") ?? "unknown";
+			const from = caller ?? "unknown";
 			const body = `Your twin just finished a call with ${from}. Last thing they said: "${heard.slice(0, 200)}". Full transcript: generateai.build/twin`;
 			c.executionCtx.waitUntil(
 				twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
