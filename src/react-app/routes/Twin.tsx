@@ -54,6 +54,7 @@ export function Twin() {
 	const [profileName, setProfileName] = useState("");
 	const [profilePersona, setProfilePersona] = useState("");
 	const [profileNumberSid, setProfileNumberSid] = useState("");
+	const [buyArea, setBuyArea] = useState("");
 
 	const refresh = () => qc.invalidateQueries({ queryKey: ["twin-status"] });
 
@@ -129,6 +130,13 @@ export function Twin() {
 	const deleteProfile = useMutation({
 		mutationFn: (id: string) => api.twinDeleteProfile(id),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-profiles"] }),
+	});
+	const buyExtra = useMutation({
+		mutationFn: () => api.twinBuyExtraNumber(buyArea.trim()),
+		onSuccess: () => {
+			setBuyArea("");
+			qc.invalidateQueries({ queryKey: ["twin-numbers"] });
+		},
 	});
 	const addContact = useMutation({
 		mutationFn: () => api.twinAddContact({ name: contactName.trim(), phone: contactPhone.trim() }),
@@ -510,10 +518,25 @@ export function Twin() {
 						{saveProfile.isPending ? "Creating…" : "Create twin"}
 					</Button>
 					{saveProfile.isError && <div className="text-xs text-red-400">{errMsg(saveProfile.error)}</div>}
-					<p className="text-xs text-zinc-600">
-						Numbers listed are unused ones already on your Twilio account — buy extras in step 2 above, then attach
-						them here.
-					</p>
+					<div className="mt-2 border-t border-white/5 pt-3">
+						<div className="mb-1 text-xs text-zinc-400">
+							Need another number? Buy one here (~$1.15/mo) — it lands in the list above, ready to attach. You can
+							also text your twin: <i>"buy 952 number"</i>.
+						</div>
+						<div className="flex gap-2">
+							<input
+								className={inputCls + " max-w-32"}
+								placeholder="Area code"
+								value={buyArea}
+								onChange={(e) => setBuyArea(e.target.value)}
+							/>
+							<Button size="sm" variant="outline" disabled={!/^\d{3}$/.test(buyArea.trim()) || buyExtra.isPending} onClick={() => buyExtra.mutate()}>
+								{buyExtra.isPending ? "Buying…" : "Buy number"}
+							</Button>
+						</div>
+						{buyExtra.data && <div className="mt-1 text-xs text-emerald-400">Bought {buyExtra.data.number} — pick it in the dropdown above.</div>}
+						{buyExtra.isError && <div className="mt-1 text-xs text-red-400">{errMsg(buyExtra.error)}</div>}
+					</div>
 				</div>
 			</Card>
 

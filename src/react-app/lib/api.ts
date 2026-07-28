@@ -90,6 +90,8 @@ export const api = {
 	twinSaveProfile: (body: { id?: string; name: string; persona: string; voiceId?: string; numberSid?: string; phoneNumber?: string }) =>
 		req<{ ok: true; id: string; number: string | null }>("/api/twin/profiles", { method: "POST", body: JSON.stringify(body) }),
 	twinDeleteProfile: (id: string) => req<{ ok: true }>(`/api/twin/profiles/${id}`, { method: "DELETE" }),
+	twinBuyExtraNumber: (area: string) =>
+		req<{ ok: true; number: string }>("/api/twin/numbers/buy", { method: "POST", body: JSON.stringify({ area }) }),
 };
 
 export type TwinStatus = {
