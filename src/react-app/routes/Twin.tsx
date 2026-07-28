@@ -54,6 +54,7 @@ export function Twin() {
 	const [profileName, setProfileName] = useState("");
 	const [profilePersona, setProfilePersona] = useState("");
 	const [profileNumberSid, setProfileNumberSid] = useState("");
+	const [profileVoiceId, setProfileVoiceId] = useState("");
 	const [buyArea, setBuyArea] = useState("");
 
 	const refresh = () => qc.invalidateQueries({ queryKey: ["twin-status"] });
@@ -119,11 +120,13 @@ export function Twin() {
 				name: profileName.trim(),
 				persona: profilePersona.trim(),
 				numberSid: profileNumberSid || undefined,
+				voiceId: profileVoiceId || undefined,
 			}),
 		onSuccess: () => {
 			setProfileName("");
 			setProfilePersona("");
 			setProfileNumberSid("");
+			setProfileVoiceId("");
 			qc.invalidateQueries({ queryKey: ["twin-profiles"] });
 		},
 	});
@@ -136,6 +139,23 @@ export function Twin() {
 		onSuccess: () => {
 			setBuyArea("");
 			qc.invalidateQueries({ queryKey: ["twin-numbers"] });
+		},
+	});
+	const accountVoices = useQuery({
+		queryKey: ["twin-voices"],
+		queryFn: api.twinVoices,
+		retry: false,
+		enabled: !!status.data?.voice.hasKey,
+	});
+	const [voiceQuery, setVoiceQuery] = useState("");
+	const searchVoices = useMutation({ mutationFn: () => api.twinSearchVoiceLibrary(voiceQuery.trim()) });
+	const addLibraryVoice = useMutation({
+		mutationFn: (v: { publicOwnerId: string; voiceId: string; name: string }) => api.twinAddLibraryVoice(v),
+		onSuccess: (d) => {
+			setProfileVoiceId(d.voiceId);
+			qc.invalidateQueries({ queryKey: ["twin-voices"] });
+			searchVoices.reset();
+			setVoiceQuery("");
 		},
 	});
 	const addContact = useMutation({
@@ -163,6 +183,8 @@ export function Twin() {
 		);
 	}
 	const s = status.data!;
+	// Owned numbers: freshly-connected list if present, otherwise the query.
+	const ownedList = ownedNumbers ?? ownedForProfiles.data?.numbers ?? null;
 	const twilioDone = s.twilio.connected;
 	const numberDone = !!s.twilio.number;
 	const voiceDone = s.voice.hasKey && !!s.voice.voiceId;
@@ -229,13 +251,21 @@ export function Twin() {
 					<p className="mt-2 text-xs text-zinc-500">Connect Twilio first.</p>
 				) : (
 					<div className="mt-3 space-y-4 text-sm">
-						{ownedNumbers && ownedNumbers.length > 0 && (
+						{ownedList && ownedList.length > 0 && (
 							<div>
-								<div className="mb-1 text-xs text-zinc-400">Numbers already on your account — one click to use it for the twin:</div>
-								{ownedNumbers.map((n) => (
+								<div className="mb-1 text-xs text-zinc-400">Numbers already on your account — one click to make one the main twin's:</div>
+								{ownedList.map((n) => (
 									<div key={n.sid} className="flex items-center justify-between border-b border-white/5 py-2 last:border-0">
-										<span className="tabular-nums">{n.phoneNumber}</span>
-										<Button size="sm" variant="secondary" disabled={setNumber.isPending} onClick={() => setNumber.mutate({ numberSid: n.sid })}>
+										<span className="tabular-nums">
+											{n.phoneNumber}
+											{s.twilio.number === n.phoneNumber && <span className="ml-2 text-xs text-emerald-400">✓ main twin</span>}
+										</span>
+										<Button
+											size="sm"
+											variant="secondary"
+											disabled={setNumber.isPending || s.twilio.number === n.phoneNumber}
+											onClick={() => setNumber.mutate({ numberSid: n.sid })}
+										>
 											Use for twin
 										</Button>
 									</div>
@@ -509,6 +539,45 @@ export function Twin() {
 								</option>
 							))}
 					</select>
+					<select className={inputCls + " max-w-72"} value={profileVoiceId} onChange={(e) => setProfileVoiceId(e.target.value)}>
+						<option value="">Voice: same as main twin</option>
+						{accountVoices.data?.voices.map((v) => (
+							<option key={v.id} value={v.id}>
+								Voice: {v.name}
+							</option>
+						))}
+					</select>
+					<div className="flex gap-2">
+						<input
+							className={inputCls}
+							placeholder='Find a voice in the ElevenLabs library, e.g. "robotic android"'
+							value={voiceQuery}
+							onChange={(e) => setVoiceQuery(e.target.value)}
+						/>
+						<Button size="sm" variant="outline" disabled={voiceQuery.trim().length < 3 || searchVoices.isPending} onClick={() => searchVoices.mutate()}>
+							{searchVoices.isPending ? "Searching…" : "Search"}
+						</Button>
+					</div>
+					{searchVoices.isError && <div className="text-xs text-red-400">{errMsg(searchVoices.error)}</div>}
+					{searchVoices.data?.voices.length === 0 && <div className="text-xs text-zinc-500">No library voices matched — try different words.</div>}
+					{searchVoices.data?.voices.map((v) => (
+						<div key={v.voiceId} className="flex items-center justify-between border-b border-white/5 py-1.5 text-sm last:border-0">
+							<span>
+								{v.name}
+								<span className="ml-2 text-xs text-zinc-500">{v.description}</span>
+							</span>
+							<Button
+								size="sm"
+								variant="secondary"
+								disabled={addLibraryVoice.isPending}
+								onClick={() => addLibraryVoice.mutate({ publicOwnerId: v.publicOwnerId, voiceId: v.voiceId, name: v.name })}
+							>
+								Use this voice
+							</Button>
+						</div>
+					))}
+					{addLibraryVoice.isError && <div className="text-xs text-red-400">{errMsg(addLibraryVoice.error)}</div>}
+					{addLibraryVoice.isSuccess && <div className="text-xs text-emerald-400">Voice added and selected for this twin.</div>}
 					<Button
 						size="sm"
 						className="self-start"

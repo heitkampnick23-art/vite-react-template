@@ -92,6 +92,10 @@ export const api = {
 	twinDeleteProfile: (id: string) => req<{ ok: true }>(`/api/twin/profiles/${id}`, { method: "DELETE" }),
 	twinBuyExtraNumber: (area: string) =>
 		req<{ ok: true; number: string }>("/api/twin/numbers/buy", { method: "POST", body: JSON.stringify({ area }) }),
+	twinSearchVoiceLibrary: (q: string) =>
+		req<{ voices: TwinLibraryVoice[] }>(`/api/twin/voices/search?q=${encodeURIComponent(q)}`),
+	twinAddLibraryVoice: (body: { publicOwnerId: string; voiceId: string; name: string }) =>
+		req<{ ok: true; voiceId: string }>("/api/twin/voices/add", { method: "POST", body: JSON.stringify(body) }),
 };
 
 export type TwinStatus = {
@@ -107,6 +111,7 @@ export type TwinVoice = { id: string; name: string; category: string };
 export type TwinContact = { id: string; name: string; phone: string; notes: string | null };
 export type TwinFact = { id: string; fact: string; created_at: number };
 export type TwinProfile = { id: string; name: string; persona: string; number: string | null; voiceId: string | null };
+export type TwinLibraryVoice = { publicOwnerId: string; voiceId: string; name: string; category: string; description: string };
 export type TwinForwarding = {
 	number: string;
 	carriers: Array<{ carrier: string; activate: Array<{ label: string; code: string }>; deactivate: string }>;

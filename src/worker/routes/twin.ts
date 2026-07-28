@@ -1420,6 +1420,50 @@ twin.post(
 	},
 );
 
+// Search the public ElevenLabs voice library (shared voices) by name/keyword.
+twin.get("/voices/search", ownerOnly, async (c) => {
+	const cfg = await loadCfg(c.env);
+	if (!cfg.elevenKey) return c.json({ error: "elevenlabs_not_connected" }, 400);
+	const q = (c.req.query("q") ?? "").slice(0, 80);
+	const res = await fetch(`https://api.elevenlabs.io/v1/shared-voices?page_size=10&search=${encodeURIComponent(q)}`, {
+		headers: { "xi-api-key": cfg.elevenKey },
+	});
+	if (!res.ok) return c.json({ error: "elevenlabs_error", message: (await res.text()).slice(0, 300) }, 502);
+	const data = (await res.json()) as {
+		voices?: Array<{ public_owner_id: string; voice_id: string; name: string; category?: string; description?: string }>;
+	};
+	return c.json({
+		voices: (data.voices ?? []).map((v) => ({
+			publicOwnerId: v.public_owner_id,
+			voiceId: v.voice_id,
+			name: v.name,
+			category: v.category ?? "",
+			description: (v.description ?? "").slice(0, 140),
+		})),
+	});
+});
+
+// Add a library voice to the account so it shows up in /voices and can be
+// assigned to a twin.
+twin.post(
+	"/voices/add",
+	ownerOnly,
+	zValidator("json", z.object({ publicOwnerId: z.string().min(8), voiceId: z.string().min(4), name: z.string().min(1).max(80) })),
+	async (c) => {
+		const cfg = await loadCfg(c.env);
+		if (!cfg.elevenKey) return c.json({ error: "elevenlabs_not_connected" }, 400);
+		const { publicOwnerId, voiceId, name } = c.req.valid("json");
+		const res = await fetch(`https://api.elevenlabs.io/v1/voices/add/${publicOwnerId}/${voiceId}`, {
+			method: "POST",
+			headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+			body: JSON.stringify({ new_name: name }),
+		});
+		if (!res.ok) return c.json({ error: "elevenlabs_error", message: (await res.text()).slice(0, 300) }, 502);
+		const data = (await res.json()) as { voice_id?: string };
+		return c.json({ ok: true, voiceId: data.voice_id ?? voiceId });
+	},
+);
+
 // List voices with whatever key is on file (site-entered or worker secret).
 twin.get("/voices", ownerOnly, async (c) => {
 	const cfg = await loadCfg(c.env);
