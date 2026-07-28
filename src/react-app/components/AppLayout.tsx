@@ -38,7 +38,8 @@ export function AppLayout() {
 		{ to: "/dashboard", label: "Projects", icon: LayoutGrid },
 		{ to: "/new", label: "New Build", icon: Wand2 },
 		{ to: "/heal", label: "Self-Heal", icon: FlaskConical },
-		{ to: "/twin", label: "Phone Twin", icon: Phone },
+		{ to: "/app", label: "Twin Remote", icon: Phone },
+		{ to: "/twin", label: "Twin Setup", icon: Phone },
 		{ to: "/billing", label: "Billing", icon: CreditCard },
 		{ to: "/account", label: "Account", icon: Settings },
 	];

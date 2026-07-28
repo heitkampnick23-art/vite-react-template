@@ -86,10 +86,14 @@ async function ensureTable(db: D1Database) {
 		db.prepare(
 			`CREATE TABLE IF NOT EXISTS twin_profiles (
 				id TEXT PRIMARY KEY, name TEXT NOT NULL, persona TEXT NOT NULL,
-				number TEXT UNIQUE, voice_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+				number TEXT UNIQUE, voice_id TEXT, voice_speed REAL,
+				created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 			)`,
 		),
 	]);
+	// Older deployments created twin_profiles without voice_speed; add it in
+	// place (no-op error once it exists).
+	await db.prepare("ALTER TABLE twin_profiles ADD COLUMN voice_speed REAL").run().catch(() => {});
 }
 
 // Persist the running transcript so the owner can read every conversation later.
@@ -560,6 +564,7 @@ type TwinCfg = {
 	elevenVoice: string;
 	persona: string;
 	twinName: string;
+	voiceSpeed: number;
 	sources: { twilio: "site" | "secret" | null; voice: "site" | "secret" | null };
 };
 
@@ -587,6 +592,7 @@ async function loadCfg(env: Env): Promise<TwinCfg> {
 		elevenVoice: raw.eleven_voice || env.ELEVENLABS_VOICE_ID || "",
 		persona: raw.persona || DEFAULT_PERSONA,
 		twinName: raw.twin_name || DEFAULT_TWIN_NAME,
+		voiceSpeed: Number(env.TWIN_VOICE_SPEED) || 1.12,
 		sources: {
 			twilio: raw.twilio_sid ? "site" : env.TWILIO_ACCOUNT_SID ? "secret" : null,
 			voice: raw.eleven_key ? "site" : env.ELEVENLABS_API_KEY ? "secret" : null,
@@ -607,12 +613,13 @@ type TwinProfile = {
 	persona: string;
 	number: string | null;
 	voice_id: string | null;
+	voice_speed: number | null;
 };
 
 async function loadProfiles(env: Env): Promise<TwinProfile[]> {
 	await ensureTable(env.DB);
 	const rows = await env.DB
-		.prepare("SELECT id, name, persona, number, voice_id FROM twin_profiles ORDER BY created_at")
+		.prepare("SELECT id, name, persona, number, voice_id, voice_speed FROM twin_profiles ORDER BY created_at")
 		.all<TwinProfile>();
 	return rows.results ?? [];
 }
@@ -624,6 +631,7 @@ function applyProfile(cfg: TwinCfg, p: TwinProfile): TwinCfg {
 		persona: p.persona,
 		twilioNumber: p.number ?? cfg.twilioNumber,
 		elevenVoice: p.voice_id || cfg.elevenVoice,
+		voiceSpeed: p.voice_speed ?? cfg.voiceSpeed,
 	};
 }
 
@@ -644,7 +652,7 @@ async function overlayProfile(env: Env, cfg: TwinCfg, nums: Array<string | null>
 // account's voices or, failing that, the ElevenLabs shared library — and text
 // the owner when the twin goes live. Returns "" when there is nothing to do.
 async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
-	let seeds: Array<{ name?: string; number?: string; voiceQuery?: string; persona?: string }>;
+	let seeds: Array<{ name?: string; number?: string; voiceQuery?: string; persona?: string; voiceSpeed?: number }>;
 	try {
 		seeds = JSON.parse(String(env.TWIN_SEED_PROFILES || "[]"));
 	} catch {
@@ -653,10 +661,23 @@ async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
 	if (!Array.isArray(seeds) || !seeds.length) return "";
 	if (!cfg.twilioSid || !cfg.twilioToken) return "";
 	const profiles = await loadProfiles(env);
+	const clampSpeed = (s: number) => Math.min(1.2, Math.max(0.7, s));
 
 	for (const seed of seeds) {
 		if (!seed?.name || !seed.persona) continue;
-		if (profiles.some((p) => p.name.toLowerCase() === seed.name!.toLowerCase())) continue;
+		const existing = profiles.find((p) => p.name.toLowerCase() === seed.name!.toLowerCase());
+		if (existing) {
+			// The profile itself is never overwritten, but a changed seed
+			// voiceSpeed is applied so voice tuning can ship from a deploy.
+			if (typeof seed.voiceSpeed === "number" && clampSpeed(seed.voiceSpeed) !== existing.voice_speed) {
+				await env.DB
+					.prepare("UPDATE twin_profiles SET voice_speed = ?, updated_at = ? WHERE id = ?")
+					.bind(clampSpeed(seed.voiceSpeed), Date.now(), existing.id)
+					.run();
+				return `seed: set ${seed.name} voice speed to ${clampSpeed(seed.voiceSpeed)}`;
+			}
+			continue;
+		}
 		const wanted = seed.number ? e164(seed.number) : null;
 
 		const ownedRes = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=50");
@@ -728,9 +749,18 @@ async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
 
 		await env.DB
 			.prepare(
-				`INSERT INTO twin_profiles (id, name, persona, number, voice_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)`,
+				`INSERT INTO twin_profiles (id, name, persona, number, voice_id, voice_speed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)`,
 			)
-			.bind(crypto.randomUUID(), seed.name, seed.persona, wanted, voiceId, Date.now(), Date.now())
+			.bind(
+				crypto.randomUUID(),
+				seed.name,
+				seed.persona,
+				wanted,
+				voiceId,
+				typeof seed.voiceSpeed === "number" ? clampSpeed(seed.voiceSpeed) : null,
+				Date.now(),
+				Date.now(),
+			)
 			.run();
 		if (env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
 			await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
@@ -852,8 +882,9 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 				voice_settings: {
 					stability: 0.5,
 					similarity_boost: 0.85,
-					// Slightly faster than natural (ElevenLabs range 0.7–1.2).
-					speed: Number(env.TWIN_VOICE_SPEED) || 1.12,
+					// Per-twin speed; default slightly faster than natural
+					// (ElevenLabs range 0.7–1.2).
+					speed: cfg.voiceSpeed,
 				},
 			}),
 		},
@@ -1650,7 +1681,14 @@ twin.post(
 twin.get("/profiles", ownerOnly, async (c) => {
 	const profiles = await loadProfiles(c.env);
 	return c.json({
-		profiles: profiles.map((p) => ({ id: p.id, name: p.name, persona: p.persona, number: p.number, voiceId: p.voice_id })),
+		profiles: profiles.map((p) => ({
+			id: p.id,
+			name: p.name,
+			persona: p.persona,
+			number: p.number,
+			voiceId: p.voice_id,
+			voiceSpeed: p.voice_speed,
+		})),
 	});
 });
 
@@ -1667,13 +1705,14 @@ twin.post(
 			name: z.string().min(1).max(40),
 			persona: z.string().min(10).max(4000),
 			voiceId: z.string().min(4).optional(),
+			voiceSpeed: z.number().min(0.7).max(1.2).optional(),
 			numberSid: z.string().regex(/^PN[a-f0-9]{32}$/i).optional(),
 			phoneNumber: z.string().regex(/^\+\d{8,15}$/).optional(),
 		}),
 	),
 	async (c) => {
 		const cfg = await loadCfg(c.env);
-		const { id, name, persona, voiceId, numberSid, phoneNumber } = c.req.valid("json");
+		const { id, name, persona, voiceId, voiceSpeed, numberSid, phoneNumber } = c.req.valid("json");
 		if ((numberSid || phoneNumber) && (!cfg.twilioSid || !cfg.twilioToken)) {
 			return c.json({ error: "twilio_not_connected" }, 400);
 		}
@@ -1701,12 +1740,12 @@ twin.post(
 		try {
 			await c.env.DB
 				.prepare(
-					`INSERT INTO twin_profiles (id, name, persona, number, voice_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)
+					`INSERT INTO twin_profiles (id, name, persona, number, voice_id, voice_speed, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)
 					 ON CONFLICT(id) DO UPDATE SET name = excluded.name, persona = excluded.persona,
 						number = COALESCE(excluded.number, number), voice_id = COALESCE(excluded.voice_id, voice_id),
-						updated_at = excluded.updated_at`,
+						voice_speed = COALESCE(excluded.voice_speed, voice_speed), updated_at = excluded.updated_at`,
 				)
-				.bind(profileId, name, persona, number, voiceId ?? null, Date.now(), Date.now())
+				.bind(profileId, name, persona, number, voiceId ?? null, voiceSpeed ?? null, Date.now(), Date.now())
 				.run();
 		} catch {
 			return c.json({ error: "number_in_use", message: "Another twin already uses that number." }, 400);
