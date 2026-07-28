@@ -1,0 +1,213 @@
+// /app — the phone-first twin remote. One screen, big touch targets: your
+// twins with tap-to-call/text, tap-to-dial forwarding codes, quick add for
+// facts and contacts, digest-now, and the latest conversations. The
+// home-screen app (manifest start_url) opens here; /twin remains the full
+// setup page.
+
+import { useState } from "react";
+import { Link } from "react-router-dom";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api } from "../lib/api";
+import { Card } from "../components/ui/Card";
+import { Button } from "../components/ui/Button";
+import { Brain, MessageSquare, Moon, Phone, PhoneForwarded, Settings, UserPlus } from "lucide-react";
+
+function errMsg(e: unknown) {
+	if (e instanceof Error) {
+		const body = (e as Error & { body?: { message?: string; error?: string } }).body;
+		return body?.message ?? body?.error ?? e.message;
+	}
+	return "Something went wrong.";
+}
+
+const inputCls =
+	"w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm outline-none placeholder:text-zinc-600 focus:border-brand-400";
+
+// tel: needs * and # percent-encoded to survive iOS dialing.
+const telHref = (code: string) => `tel:${code.replace(/\*/g, "%2A").replace(/#/g, "%23")}`;
+
+export function Remote() {
+	const qc = useQueryClient();
+	const status = useQuery({ queryKey: ["twin-status"], queryFn: api.twinStatus, retry: false });
+	const profiles = useQuery({ queryKey: ["twin-profiles"], queryFn: api.twinProfiles, retry: false });
+	const calls = useQuery({ queryKey: ["twin-calls"], queryFn: api.twinCalls, retry: false, refetchInterval: 30_000 });
+	const [fwdTarget, setFwdTarget] = useState("");
+	const forwarding = useQuery({
+		queryKey: ["twin-forwarding", fwdTarget],
+		queryFn: () => api.twinForwarding(fwdTarget || undefined),
+		retry: false,
+	});
+
+	const [fact, setFact] = useState("");
+	const addFact = useMutation({
+		mutationFn: () => api.twinAddFact(fact.trim()),
+		onSuccess: () => setFact(""),
+	});
+	const [cName, setCName] = useState("");
+	const [cPhone, setCPhone] = useState("");
+	const addContact = useMutation({
+		mutationFn: () => api.twinAddContact({ name: cName.trim(), phone: cPhone.trim() }),
+		onSuccess: () => {
+			setCName("");
+			setCPhone("");
+			qc.invalidateQueries({ queryKey: ["twin-contacts"] });
+		},
+	});
+	const digest = useMutation({ mutationFn: api.twinDigestNow });
+
+	if (status.isLoading) {
+		return <div className="grid min-h-[50vh] place-items-center text-sm text-zinc-500">Loading…</div>;
+	}
+	if (status.isError) {
+		return (
+			<div className="mx-auto max-w-md p-4">
+				<Card className="text-sm text-zinc-400">{errMsg(status.error)}</Card>
+			</div>
+		);
+	}
+	const s = status.data!;
+	const twins = [
+		{ id: "", name: s.twinName, number: s.twilio.number },
+		...(profiles.data?.profiles.filter((p) => p.number).map((p) => ({ id: p.id, name: p.name, number: p.number })) ?? []),
+	].filter((t): t is { id: string; name: string; number: string } => !!t.number);
+
+	return (
+		<div className="mx-auto max-w-md p-4 pb-10">
+			{/* Twins */}
+			{twins.map((t) => (
+				<Card key={t.id || "main"} className="mb-3">
+					<div className="flex items-center justify-between">
+						<div>
+							<div className="font-semibold">{t.name}</div>
+							<div className="tabular-nums text-sm text-zinc-400">{t.number}</div>
+						</div>
+						<div className="flex gap-2">
+							<a href={`tel:${t.number}`} className="rounded-lg bg-emerald-500/15 p-3 text-emerald-300" aria-label={`Call ${t.name}`}>
+								<Phone className="h-5 w-5" />
+							</a>
+							<a href={`sms:${t.number}`} className="rounded-lg bg-sky-500/15 p-3 text-sky-300" aria-label={`Text ${t.name}`}>
+								<MessageSquare className="h-5 w-5" />
+							</a>
+						</div>
+					</div>
+				</Card>
+			))}
+
+			{/* Forwarding */}
+			{forwarding.data && (
+				<Card className="mb-3">
+					<div className="flex items-center gap-2 text-sm font-semibold">
+						<PhoneForwarded className="h-4 w-4" /> Missed calls go to…
+					</div>
+					{forwarding.data.targets.length > 1 && (
+						<select className={inputCls + " mt-2"} value={forwarding.data.number} onChange={(e) => setFwdTarget(e.target.value)}>
+							{forwarding.data.targets.map((t) => (
+								<option key={t.number} value={t.number}>
+									{t.name} ({t.number})
+								</option>
+							))}
+						</select>
+					)}
+					<p className="mt-2 text-xs text-zinc-500">Tap your carrier's code to dial it — that turns forwarding on.</p>
+					<div className="mt-2 flex flex-col gap-1.5">
+						{forwarding.data.carriers.slice(0, 1).flatMap((cr) => cr.activate).map((a) => (
+							<a key={a.code} href={telHref(a.code)} className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2.5 text-sm">
+								<span className="text-zinc-400">AT&amp;T / T-Mobile</span>
+								<code className="text-brand-300">{a.code}</code>
+							</a>
+						))}
+						{forwarding.data.carriers.slice(2, 3).flatMap((cr) => cr.activate).map((a) => (
+							<a key={a.code} href={telHref(a.code)} className="flex items-center justify-between rounded-lg bg-white/5 px-3 py-2.5 text-sm">
+								<span className="text-zinc-400">Verizon</span>
+								<code className="text-brand-300">{a.code}</code>
+							</a>
+						))}
+						<div className="flex gap-1.5">
+							<a href={telHref("##004#")} className="flex-1 rounded-lg bg-white/5 px-3 py-2 text-center text-xs text-zinc-500">
+								Off (AT&amp;T/T-Mob): ##004#
+							</a>
+							<a href={telHref("*73")} className="flex-1 rounded-lg bg-white/5 px-3 py-2 text-center text-xs text-zinc-500">
+								Off (Verizon): *73
+							</a>
+						</div>
+					</div>
+				</Card>
+			)}
+
+			{/* Quick add fact */}
+			<Card className="mb-3">
+				<div className="flex items-center gap-2 text-sm font-semibold">
+					<Brain className="h-4 w-4" /> Tell your twins something
+				</div>
+				<div className="mt-2 flex gap-2">
+					<input
+						className={inputCls}
+						placeholder="e.g. I'm out of town until Friday"
+						value={fact}
+						onChange={(e) => setFact(e.target.value)}
+						onKeyDown={(e) => e.key === "Enter" && fact.trim().length >= 3 && addFact.mutate()}
+					/>
+					<Button size="sm" disabled={fact.trim().length < 3 || addFact.isPending} onClick={() => addFact.mutate()}>
+						{addFact.isPending ? "…" : "Save"}
+					</Button>
+				</div>
+				{addFact.isSuccess && <div className="mt-1 text-xs text-emerald-400">Saved — both twins know it now.</div>}
+				{addFact.isError && <div className="mt-1 text-xs text-red-400">{errMsg(addFact.error)}</div>}
+			</Card>
+
+			{/* Quick add contact */}
+			<Card className="mb-3">
+				<div className="flex items-center gap-2 text-sm font-semibold">
+					<UserPlus className="h-4 w-4" /> Add a contact
+				</div>
+				<div className="mt-2 flex gap-2">
+					<input className={inputCls} placeholder="Name" value={cName} onChange={(e) => setCName(e.target.value)} />
+					<input className={inputCls} placeholder="9525551234" value={cPhone} onChange={(e) => setCPhone(e.target.value)} />
+					<Button size="sm" disabled={!cName.trim() || !cPhone.trim() || addContact.isPending} onClick={() => addContact.mutate()}>
+						{addContact.isPending ? "…" : "Add"}
+					</Button>
+				</div>
+				{addContact.isSuccess && <div className="mt-1 text-xs text-emerald-400">Saved.</div>}
+				{addContact.isError && <div className="mt-1 text-xs text-red-400">{errMsg(addContact.error)}</div>}
+			</Card>
+
+			{/* Digest now */}
+			<Card className="mb-3">
+				<div className="flex items-center justify-between">
+					<div className="flex items-center gap-2 text-sm font-semibold">
+						<Moon className="h-4 w-4" /> Today's digest
+					</div>
+					<Button size="sm" variant="outline" disabled={digest.isPending} onClick={() => digest.mutate()}>
+						{digest.isPending ? "Sending…" : "Text it to me now"}
+					</Button>
+				</div>
+				{digest.data && <div className="mt-1 text-xs text-zinc-500">{digest.data.ok ? "Sent — check your messages." : digest.data.note}</div>}
+			</Card>
+
+			{/* Recent conversations */}
+			<Card className="mb-3">
+				<div className="text-sm font-semibold">Latest conversations</div>
+				{calls.data?.calls.length === 0 && <div className="mt-2 text-sm text-zinc-500">Nothing yet.</div>}
+				{calls.data?.calls.slice(0, 3).map((call) => (
+					<details key={call.id} className="mt-2 rounded-lg border border-white/5 bg-black/20 p-2.5 text-sm">
+						<summary className="cursor-pointer">
+							<span className="tabular-nums">{call.from ?? "unknown"}</span>
+							<span className="ml-2 text-xs text-zinc-500">{new Date(call.startedAt).toLocaleString()}</span>
+						</summary>
+						<div className="mt-2 space-y-1">
+							{call.turns.map((t, i) => (
+								<div key={i} className={t.role === "assistant" ? "text-brand-300" : "text-zinc-200"}>
+									<b>{t.role === "assistant" ? "Twin" : "Caller"}:</b> {t.content}
+								</div>
+							))}
+						</div>
+					</details>
+				))}
+			</Card>
+
+			<Link to="/twin" className="flex items-center justify-center gap-2 py-2 text-sm text-zinc-500">
+				<Settings className="h-4 w-4" /> Full twin setup
+			</Link>
+		</div>
+	);
+}

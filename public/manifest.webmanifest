@@ -2,7 +2,7 @@
 	"name": "Phone Twin",
 	"short_name": "Phone Twin",
 	"description": "Control your AI phone twins: numbers, personas, contacts, facts, transcripts.",
-	"start_url": "/twin",
+	"start_url": "/app",
 	"scope": "/",
 	"display": "standalone",
 	"background_color": "#09090b",

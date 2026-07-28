@@ -10,6 +10,7 @@ import { Billing } from "./routes/Billing";
 import { Heal } from "./routes/Heal";
 import { Account } from "./routes/Account";
 import { Twin } from "./routes/Twin";
+import { Remote } from "./routes/Remote";
 import { Terms, Privacy } from "./routes/Legal";
 import { AppLayout } from "./components/AppLayout";
 import { api } from "./lib/api";
@@ -37,6 +38,7 @@ function App() {
 				<Route path="/billing" element={<Billing />} />
 				<Route path="/heal" element={<Heal />} />
 				<Route path="/twin" element={<Twin />} />
+				<Route path="/app" element={<Remote />} />
 				<Route path="/account" element={<Account />} />
 			</Route>
 			<Route path="*" element={<Navigate to="/" replace />} />
