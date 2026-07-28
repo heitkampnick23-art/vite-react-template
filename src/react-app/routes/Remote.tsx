@@ -10,7 +10,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { Brain, MessageSquare, Moon, Phone, PhoneForwarded, Settings, UserPlus } from "lucide-react";
+import { Brain, MessageSquare, Moon, Phone, PhoneForwarded, Settings, Stethoscope, UserPlus } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -54,6 +54,7 @@ export function Remote() {
 		},
 	});
 	const digest = useMutation({ mutationFn: api.twinDigestNow });
+	const syscheck = useMutation({ mutationFn: api.twinSysCheck });
 
 	if (status.isLoading) {
 		return <div className="grid min-h-[50vh] place-items-center text-sm text-zinc-500">Loading…</div>;
@@ -182,6 +183,64 @@ export function Remote() {
 					</Button>
 				</div>
 				{digest.data && <div className="mt-1 text-xs text-zinc-500">{digest.data.ok ? "Sent — check your messages." : digest.data.note}</div>}
+			</Card>
+
+			{/* System check */}
+			<Card className="mb-3">
+				<div className="flex items-center justify-between">
+					<div className="flex items-center gap-2 text-sm font-semibold">
+						<Stethoscope className="h-4 w-4" /> System check
+					</div>
+					<Button size="sm" variant="outline" disabled={syscheck.isPending} onClick={() => syscheck.mutate()}>
+						{syscheck.isPending ? "Checking…" : "Run check"}
+					</Button>
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Verifies both twins' wiring (auto-fixes it), then reads Twilio's own delivery log to explain any failed
+					texts or transfers.
+				</p>
+				{syscheck.isError && <div className="mt-2 text-xs text-red-400">{errMsg(syscheck.error)}</div>}
+				{syscheck.data && (
+					<div className="mt-2 space-y-1.5">
+						{syscheck.data.findings.map((f, i) => (
+							<div
+								key={i}
+								className={
+									"rounded-lg px-2.5 py-1.5 text-xs " +
+									(f.startsWith("✗")
+										? "bg-red-500/10 text-red-300"
+										: f.startsWith("✓")
+											? "bg-emerald-500/10 text-emerald-300"
+											: "bg-white/5 text-zinc-400")
+								}
+							>
+								{f}
+							</div>
+						))}
+						{(syscheck.data.recentMessages?.length ?? 0) > 0 && (
+							<details className="rounded-lg border border-white/5 bg-black/20 p-2 text-xs text-zinc-400">
+								<summary className="cursor-pointer">Raw message log</summary>
+								{syscheck.data.recentMessages!.map((m, i) => (
+									<div key={i} className="mt-1 border-b border-white/5 pb-1 last:border-0">
+										{m.dir.includes("inbound") ? "→ in" : "← out"} {m.from} → {m.to}: <b>{m.status}</b>
+										{m.errorCode ? <span className="text-red-400"> (err {m.errorCode})</span> : null}
+										<div className="text-zinc-600">{m.body}</div>
+									</div>
+								))}
+							</details>
+						)}
+						{(syscheck.data.recentCalls?.length ?? 0) > 0 && (
+							<details className="rounded-lg border border-white/5 bg-black/20 p-2 text-xs text-zinc-400">
+								<summary className="cursor-pointer">Raw call log</summary>
+								{syscheck.data.recentCalls!.map((cl, i) => (
+									<div key={i} className="mt-1 border-b border-white/5 pb-1 last:border-0">
+										{cl.dir} {cl.from} → {cl.to}: <b>{cl.status}</b> {cl.seconds ? `${cl.seconds}s` : ""}
+									</div>
+								))}
+							</details>
+						)}
+					</div>
+				)}
 			</Card>
 
 			{/* Recent conversations */}
