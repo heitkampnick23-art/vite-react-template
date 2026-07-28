@@ -47,21 +47,49 @@ const ownerOnly: MiddlewareHandler<AppEnv> = async (c, next) => {
 const SECRET_KEYS = new Set(["twilio_token", "eleven_key"]);
 
 async function ensureTable(db: D1Database) {
-	await db
-		.prepare(
+	await db.batch([
+		db.prepare(
 			`CREATE TABLE IF NOT EXISTS twin_config (
 				key TEXT PRIMARY KEY, value TEXT NOT NULL, iv TEXT, updated_at INTEGER NOT NULL
 			)`,
-		)
-		.run();
-	await db
-		.prepare(
+		),
+		db.prepare(
 			`CREATE TABLE IF NOT EXISTS twin_calls (
 				id TEXT PRIMARY KEY, from_number TEXT, transcript TEXT NOT NULL,
 				started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 			)`,
-		)
-		.run();
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_contacts (
+				id TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, phone TEXT NOT NULL,
+				notes TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			)`,
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_texts (
+				id TEXT PRIMARY KEY, direction TEXT NOT NULL, peer_number TEXT NOT NULL,
+				body TEXT NOT NULL, created_at INTEGER NOT NULL
+			)`,
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_callers (
+				phone TEXT PRIMARY KEY, name TEXT, summary TEXT NOT NULL DEFAULT '',
+				call_count INTEGER NOT NULL DEFAULT 0, last_call_at INTEGER,
+				summarized_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+			)`,
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_facts (
+				id TEXT PRIMARY KEY, fact TEXT NOT NULL, created_at INTEGER NOT NULL
+			)`,
+		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_profiles (
+				id TEXT PRIMARY KEY, name TEXT NOT NULL, persona TEXT NOT NULL,
+				number TEXT UNIQUE, voice_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+			)`,
+		),
+	]);
 }
 
 // Persist the running transcript so the owner can read every conversation later.
@@ -73,6 +101,178 @@ async function saveTranscript(env: Env, callSid: string, from: string | null, hi
 		)
 		.bind(callSid, from, JSON.stringify(history), Date.now(), Date.now())
 		.run();
+}
+
+// --- contacts + text log -------------------------------------------------------
+
+type Contact = { id: string; name: string; phone: string; notes: string | null };
+
+async function loadContacts(env: Env): Promise<Contact[]> {
+	await ensureTable(env.DB);
+	const rows = await env.DB
+		.prepare("SELECT id, name, phone, notes FROM twin_contacts ORDER BY name")
+		.all<Contact>();
+	return rows.results ?? [];
+}
+
+async function upsertContact(env: Env, name: string, phone: string, notes?: string) {
+	await ensureTable(env.DB);
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_contacts (id, name, phone, notes, created_at, updated_at) VALUES (?,?,?,?,?,?)
+			 ON CONFLICT(name) DO UPDATE SET phone = excluded.phone,
+				notes = COALESCE(excluded.notes, notes), updated_at = excluded.updated_at`,
+		)
+		.bind(crypto.randomUUID(), name.trim(), phone, notes ?? null, Date.now(), Date.now())
+		.run();
+}
+
+// Normalize a US-ish phone string to E.164; null if it doesn't look like one.
+function e164(raw: string): string | null {
+	let d = raw.replace(/\D/g, "");
+	if (d.length === 10) d = "1" + d;
+	if (d.length < 8 || d.length > 15) return null;
+	return "+" + d;
+}
+
+// Keep a log of real conversations (not owner↔twin control traffic) so the
+// nightly digest and the dashboard can show them.
+async function logText(env: Env, direction: "in" | "out", peer: string, body: string) {
+	if (!peer || peer === env.TWIN_NOTIFY_CELL) return;
+	await env.DB
+		.prepare("INSERT INTO twin_texts (id, direction, peer_number, body, created_at) VALUES (?,?,?,?,?)")
+		.bind(crypto.randomUUID(), direction, peer, body, Date.now())
+		.run();
+}
+
+// --- "facts about the owner" memory --------------------------------------------
+//
+// Short owner-curated facts ("my address is …", "I'm out of town till Friday")
+// the twin injects into every conversation so it can answer real questions.
+
+type Fact = { id: string; fact: string; created_at: number };
+
+async function loadFacts(env: Env): Promise<Fact[]> {
+	await ensureTable(env.DB);
+	const rows = await env.DB
+		.prepare("SELECT id, fact, created_at FROM twin_facts ORDER BY created_at DESC LIMIT 60")
+		.all<Fact>();
+	return rows.results ?? [];
+}
+
+async function addFact(env: Env, fact: string) {
+	await ensureTable(env.DB);
+	await env.DB
+		.prepare("INSERT INTO twin_facts (id, fact, created_at) VALUES (?,?,?)")
+		.bind(crypto.randomUUID(), fact.trim().slice(0, 500), Date.now())
+		.run();
+}
+
+// System-prompt block, capped so a long fact list can't crowd out the persona.
+function factsBlock(twinName: string, facts: Fact[]): string {
+	if (!facts.length) return "";
+	let block = "";
+	for (const f of facts) {
+		if (block.length + f.fact.length > 3000) break;
+		block += `\n- ${f.fact}`;
+	}
+	return ` Things you know about ${twinName} (use them to answer questions; don't volunteer private-sounding details unprompted):${block}`;
+}
+
+// --- caller memory -------------------------------------------------------------
+//
+// One row per phone number: how many times they've called, and a rolling
+// Claude-written summary of past transcripts so the twin can greet repeat
+// callers like it remembers them (it does).
+
+type CallerMemory = {
+	phone: string;
+	name: string | null;
+	summary: string;
+	call_count: number;
+	last_call_at: number | null;
+	summarized_at: number;
+};
+
+async function getCaller(env: Env, phone: string): Promise<CallerMemory | null> {
+	if (!phone) return null;
+	return await env.DB
+		.prepare("SELECT phone, name, summary, call_count, last_call_at, summarized_at FROM twin_callers WHERE phone = ?")
+		.bind(phone)
+		.first<CallerMemory>();
+}
+
+// Count a new call and fill in the name from contacts if we have it.
+async function touchCaller(env: Env, phone: string) {
+	const contact = (await loadContacts(env)).find((k) => k.phone === phone);
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_callers (phone, name, call_count, last_call_at, updated_at) VALUES (?,?,1,?,?)
+			 ON CONFLICT(phone) DO UPDATE SET call_count = call_count + 1, last_call_at = excluded.last_call_at,
+				name = COALESCE(name, excluded.name), updated_at = excluded.updated_at`,
+		)
+		.bind(phone, contact?.name ?? null, Date.now(), Date.now())
+		.run();
+}
+
+// Fold any transcripts newer than the stored summary into it (runs in
+// waitUntil — never on the caller's clock).
+async function refreshCallerSummary(env: Env, phone: string) {
+	if (!phone) return;
+	const row = await getCaller(env, phone);
+	const since = row?.summarized_at ?? 0;
+	const calls = await env.DB
+		.prepare(
+			"SELECT transcript FROM twin_calls WHERE from_number = ? AND updated_at > ? ORDER BY started_at DESC LIMIT 5",
+		)
+		.bind(phone, since)
+		.all<{ transcript: string }>();
+	const fresh = calls.results ?? [];
+	if (!fresh.length) return;
+	const transcripts = fresh
+		.map((r) => (JSON.parse(r.transcript) as Turn[]).map((t) => `${t.role === "user" ? "Caller" : "Twin"}: ${t.content}`).join("\n"))
+		.join("\n---\n")
+		.slice(0, 8000);
+	const raw = await claude(
+		env,
+		`You maintain the caller-memory file for an AI phone twin. Merge the existing memory with the new call transcripts into an updated memory. ` +
+			`Respond with ONLY JSON: {"name": "<caller's first name if they said or confirmed it, else null>", "summary": "<max 500 chars: who they are, what they've called about, anything promised or unresolved>"}`,
+		[
+			{
+				role: "user",
+				content: `Existing memory${row?.name ? ` (name: ${row.name})` : ""}: ${row?.summary || "(none)"}\n\nNew transcripts:\n${transcripts}`,
+			},
+		],
+		400,
+	);
+	const m = raw?.match(/\{[\s\S]*\}/);
+	if (!m) return;
+	let parsed: { name?: string | null; summary?: string };
+	try {
+		parsed = JSON.parse(m[0]) as { name?: string | null; summary?: string };
+	} catch {
+		return;
+	}
+	if (!parsed.summary) return;
+	await env.DB
+		.prepare(
+			`INSERT INTO twin_callers (phone, name, summary, summarized_at, updated_at) VALUES (?,?,?,?,?)
+			 ON CONFLICT(phone) DO UPDATE SET summary = excluded.summary, name = COALESCE(excluded.name, name),
+				summarized_at = excluded.summarized_at, updated_at = excluded.updated_at`,
+		)
+		.bind(phone, parsed.name ?? null, parsed.summary.slice(0, 600), Date.now(), Date.now())
+		.run();
+}
+
+// Extra system-prompt context for a call from a known number.
+function callerContext(mem: CallerMemory | null): string {
+	if (!mem || (!mem.summary && !mem.name)) return "";
+	return (
+		` This caller has phoned ${mem.call_count} time(s) before.` +
+		(mem.name ? ` Their name is ${mem.name}.` : "") +
+		(mem.summary ? ` What you remember about them from past calls: ${mem.summary}` : "") +
+		" Use this memory naturally — don't recite it."
+	);
 }
 
 async function dbSet(env: Env, key: string, value: string) {
@@ -227,6 +427,101 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 	return "idle";
 }
 
+// --- nightly digest ------------------------------------------------------------
+//
+// Once per local day, after TWIN_DIGEST_HOUR (default 9pm America/Chicago),
+// text the owner a Claude-written summary of everything the twin handled in
+// the last 24h. Idempotent — safe to call from cron, webhooks, and /wire; the
+// digest_last config key gates it to one send per day.
+
+export async function twinNightlyDigest(env: Env, force = false): Promise<string> {
+	if (!env.TWIN_NOTIFY_CELL) return "no notify cell configured";
+	const cfg = await loadCfg(env);
+	if (!cfg.twilioSid || !cfg.twilioToken || !cfg.twilioNumber) return "twilio not ready";
+
+	const tz = env.TWIN_TZ || "America/Chicago";
+	const parts = new Intl.DateTimeFormat("en-CA", {
+		timeZone: tz,
+		year: "numeric",
+		month: "2-digit",
+		day: "2-digit",
+		hour: "2-digit",
+		hour12: false,
+	}).formatToParts(new Date());
+	const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+	const today = `${get("year")}-${get("month")}-${get("day")}`;
+	const hourNow = Number(get("hour"));
+	const digestHour = Number(env.TWIN_DIGEST_HOUR) || 21;
+
+	if (!force) {
+		if (hourNow < digestHour) return `before ${digestHour}:00 ${tz}`;
+		const last = await env.DB
+			.prepare("SELECT value FROM twin_config WHERE key = 'digest_last'")
+			.first<{ value: string }>();
+		if (last?.value === today) return "already sent today";
+	}
+
+	const since = Date.now() - 24 * 3600 * 1000;
+	const calls = await env.DB
+		.prepare("SELECT from_number, transcript, started_at FROM twin_calls WHERE started_at > ? ORDER BY started_at")
+		.bind(since)
+		.all<{ from_number: string | null; transcript: string; started_at: number }>();
+	const texts = await env.DB
+		.prepare("SELECT direction, peer_number, body, created_at FROM twin_texts WHERE created_at > ? ORDER BY created_at")
+		.bind(since)
+		.all<{ direction: string; peer_number: string; body: string; created_at: number }>();
+	const callRows = calls.results ?? [];
+	const textRows = texts.results ?? [];
+	if (!force && !callRows.length && !textRows.length) {
+		await dbSet(env, "digest_last", today);
+		return "no activity — skipped";
+	}
+
+	// Map numbers to names from contacts and caller memory.
+	const names = new Map<string, string>();
+	for (const k of await loadContacts(env)) names.set(k.phone, k.name);
+	const callers = await env.DB.prepare("SELECT phone, name FROM twin_callers WHERE name IS NOT NULL").all<{ phone: string; name: string }>();
+	for (const r of callers.results ?? []) if (!names.has(r.phone)) names.set(r.phone, r.name);
+	const who = (n: string | null) => (n ? names.get(n) ?? n : "unknown");
+
+	const fmtTime = (ts: number) =>
+		new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(new Date(ts));
+	const material = [
+		...callRows.map((r) => {
+			const turns = (JSON.parse(r.transcript) as Turn[])
+				.map((t) => `${t.role === "user" ? "Caller" : "Twin"}: ${t.content}`)
+				.join("\n");
+			return `CALL at ${fmtTime(r.started_at)} from ${who(r.from_number)}:\n${turns}`;
+		}),
+		...textRows.map(
+			(r) => `TEXT ${r.direction === "in" ? "from" : "to"} ${who(r.peer_number)} at ${fmtTime(r.created_at)}: ${r.body}`,
+		),
+	]
+		.join("\n---\n")
+		.slice(0, 12000);
+
+	const summary = callRows.length || textRows.length
+		? (await claude(
+				env,
+				`Write tonight's SMS digest for ${cfg.twinName} covering everything his AI phone twin handled today. ` +
+					`Plain text only, no markdown, max 550 characters. Lead with anything that needs his follow-up, ` +
+					`then one short line per call/conversation (who + gist). Use names, not numbers, where given.`,
+				[{ role: "user", content: material || "(no activity)" }],
+				400,
+			)) ?? null
+		: "Quiet day — your twin handled no calls or texts.";
+	if (!summary) return "summarization failed";
+
+	const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+		To: env.TWIN_NOTIFY_CELL,
+		From: cfg.twilioNumber,
+		Body: `🌙 Twin digest: ${summary}`.slice(0, 1500),
+	});
+	if (!res.ok) return `send failed: ${(res.data as { message?: string }).message ?? res.status}`;
+	await dbSet(env, "digest_last", today);
+	return "sent";
+}
+
 type TwinCfg = {
 	twilioSid: string;
 	twilioToken: string;
@@ -267,6 +562,50 @@ async function loadCfg(env: Env): Promise<TwinCfg> {
 			voice: raw.eleven_key ? "site" : env.ELEVENLABS_API_KEY ? "secret" : null,
 		},
 	};
+}
+
+// --- multiple twins ------------------------------------------------------------
+//
+// Extra twins live in twin_profiles, each with its own number, name, persona,
+// and (optionally) voice. Inbound webhooks resolve which twin a call/text is
+// for by the numbers on the wire; everything else (contacts, facts, caller
+// memory, credentials, the owner's cell) is shared.
+
+type TwinProfile = {
+	id: string;
+	name: string;
+	persona: string;
+	number: string | null;
+	voice_id: string | null;
+};
+
+async function loadProfiles(env: Env): Promise<TwinProfile[]> {
+	await ensureTable(env.DB);
+	const rows = await env.DB
+		.prepare("SELECT id, name, persona, number, voice_id FROM twin_profiles ORDER BY created_at")
+		.all<TwinProfile>();
+	return rows.results ?? [];
+}
+
+function applyProfile(cfg: TwinCfg, p: TwinProfile): TwinCfg {
+	return {
+		...cfg,
+		twinName: p.name,
+		persona: p.persona,
+		twilioNumber: p.number ?? cfg.twilioNumber,
+		elevenVoice: p.voice_id || cfg.elevenVoice,
+	};
+}
+
+// Resolve the twin a webhook belongs to. Inbound: To is the twin's number.
+// Outbound (twin-initiated calls): From is the twin's number. The primary
+// twin_config twin stays the default when nothing matches.
+async function overlayProfile(env: Env, cfg: TwinCfg, nums: Array<string | null>): Promise<TwinCfg> {
+	const candidates = nums.filter((n): n is string => !!n && n !== cfg.twilioNumber);
+	if (!candidates.length) return cfg;
+	const profiles = await loadProfiles(env);
+	const hit = profiles.find((p) => p.number && candidates.includes(p.number));
+	return hit ? applyProfile(cfg, hit) : cfg;
 }
 
 // --- Twilio REST helpers -------------------------------------------------------
@@ -349,7 +688,7 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 
 type Turn = { role: "user" | "assistant"; content: string };
 
-async function personaReply(env: Env, cfg: TwinCfg, history: Turn[]): Promise<string> {
+async function claude(env: Env, system: string, messages: Turn[], maxTokens = 300): Promise<string | null> {
 	const res = await fetch("https://api.anthropic.com/v1/messages", {
 		method: "POST",
 		headers: {
@@ -357,18 +696,108 @@ async function personaReply(env: Env, cfg: TwinCfg, history: Turn[]): Promise<st
 			"anthropic-version": "2023-06-01",
 			"content-type": "application/json",
 		},
-		body: JSON.stringify({
-			model: "claude-haiku-4-5-20251001",
-			max_tokens: 200,
-			system:
-				cfg.persona +
-				" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
-			messages: history,
-		}),
+		body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: maxTokens, system, messages }),
 	});
-	if (!res.ok) return "Sorry, I glitched for a second there. Say that again?";
+	if (!res.ok) return null;
 	const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
-	return data.content?.find((b) => b.type === "text")?.text?.trim() || "Sorry, say that again?";
+	return data.content?.find((b) => b.type === "text")?.text?.trim() || null;
+}
+
+async function personaReply(env: Env, cfg: TwinCfg, history: Turn[], extraContext = ""): Promise<string> {
+	const reply = await claude(
+		env,
+		cfg.persona +
+			extraContext +
+			" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
+		history,
+		200,
+	);
+	return reply ?? "Sorry, I glitched for a second there. Say that again?";
+}
+
+// --- smart texting: owner texts the twin in plain English ----------------------
+//
+// "tell Jake I'll be there at 6" → looks Jake up in contacts, writes the text
+// the way the owner would, sends it from the twin's number, confirms back.
+
+type OwnerSmsAction =
+	| { action: "send"; to?: string; toName?: string; message?: string }
+	| { action: "add_contact"; name?: string; phone?: string }
+	| { action: "remember"; fact?: string }
+	| { action: "forget"; id?: string }
+	| { action: "reply"; reply?: string };
+
+function parseAction(raw: string | null): OwnerSmsAction | null {
+	if (!raw) return null;
+	const m = raw.match(/\{[\s\S]*\}/); // tolerate prose or code fences around the JSON
+	if (!m) return null;
+	try {
+		return JSON.parse(m[0]) as OwnerSmsAction;
+	} catch {
+		return null;
+	}
+}
+
+// Interpret an owner text and perform it. Returns the confirmation to text back.
+async function smartOwnerSms(env: Env, cfg: TwinCfg, body: string): Promise<string> {
+	const contacts = await loadContacts(env);
+	const facts = await loadFacts(env);
+	const send = (to: string, text: string) =>
+		twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", { To: to, From: cfg.twilioNumber, Body: text });
+
+	const system =
+		`You are the SMS command interpreter for ${cfg.twinName}'s AI phone twin. ` +
+		`${cfg.twinName} (the owner) just texted the twin's number; work out what they want and respond with ONLY one JSON object, no other text.\n` +
+		`Contacts:\n${contacts.map((c) => `- ${c.name}: ${c.phone}${c.notes ? ` (${c.notes})` : ""}`).join("\n") || "(none yet)"}\n` +
+		`Stored facts about ${cfg.twinName} (id: fact):\n${facts.map((f) => `- ${f.id.slice(0, 8)}: ${f.fact}`).join("\n") || "(none yet)"}\n` +
+		`Actions:\n` +
+		`1. Relay a message to someone — {"action":"send","to":"+15551234567","toName":"Jake","message":"..."}. ` +
+		`Resolve "to" from the contacts above or from a phone number written in the text. ` +
+		`Write "message" exactly as ${cfg.twinName} would text it: first person, casual, brief, no signature. ` +
+		`Since it comes from the twin's number, open with a short identifier like "It's ${cfg.twinName} — " unless the text already makes that obvious.\n` +
+		`2. Save a contact — {"action":"add_contact","name":"Jake","phone":"+15551234567"}.\n` +
+		`3. Remember a fact for future calls/texts ("remember I moved to unit 4B") — {"action":"remember","fact":"..."} with the fact rewritten as a clean standalone statement.\n` +
+		`4. Forget a stored fact — {"action":"forget","id":"<8-char id from the list>"}.\n` +
+		`5. Anything else (question, chat, unknown contact, ambiguous) — {"action":"reply","reply":"..."} with a short SMS answer, using the stored facts when relevant. ` +
+		`If they want to message someone who isn't in contacts and gave no number, say you don't have that person yet and to text: add <name> <number>.\n` +
+		`Owner's persona, for message style: ${cfg.persona.slice(0, 600)}`;
+
+	const act = parseAction(await claude(env, system, [{ role: "user", content: body }], 400));
+	if (!act) return "Hmm, I couldn't process that. Try: \"tell Jake I'll be there at 6\" or \"add Jake 9525551234\".";
+
+	if (act.action === "remember") {
+		if (!act.fact) return 'To store a fact, text: "remember <the fact>".';
+		await addFact(env, act.fact);
+		return `Got it, I'll remember: ${act.fact}`;
+	}
+	if (act.action === "forget") {
+		const hit = act.id ? facts.find((f) => f.id.startsWith(act.id!)) : undefined;
+		if (!hit) return "I couldn't tell which fact to forget — check the list on the /twin page.";
+		await env.DB.prepare("DELETE FROM twin_facts WHERE id = ?").bind(hit.id).run();
+		return `Forgotten: ${hit.fact}`;
+	}
+	if (act.action === "add_contact") {
+		const phone = act.phone ? e164(act.phone) : null;
+		if (!act.name || !phone) return 'To save a contact, text: "add Jake 9525551234".';
+		await upsertContact(env, act.name, phone);
+		return `Saved ${act.name} → ${phone}.`;
+	}
+	if (act.action === "send") {
+		const to = act.to ? e164(act.to) : null;
+		if (!to || !act.message) {
+			return act.toName
+				? `I don't have a number for ${act.toName}. Text: "add ${act.toName} 9525551234" and I'll remember them.`
+				: "I couldn't figure out who to text. Include a name from contacts or a phone number.";
+		}
+		const res = await send(to, act.message);
+		if (!res.ok) {
+			const msg = (res.data as { message?: string }).message ?? `error ${res.status}`;
+			return `Couldn't send to ${act.toName ?? to}: ${msg}`;
+		}
+		await logText(env, "out", to, act.message);
+		return `Texted ${act.toName ?? to}${act.toName ? ` (${to})` : ""}: "${act.message}"`;
+	}
+	return act.reply || 'I can relay texts ("tell Jake I\'ll be there at 6") and save contacts ("add Jake 9525551234").';
 }
 
 async function loadConvo(env: Env, callSid: string): Promise<Turn[]> {
@@ -419,25 +848,40 @@ twin.get("/voice/audio/:id", async (c) => {
 // Required by FCC rules for AI-generated voice calls: the twin must identify
 // itself as an AI at the start of every call. Do not remove.
 twin.post("/voice/incoming", async (c) => {
-	const cfg = await loadCfg(c.env);
+	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
 	if (!(await validTwilioSignature(c.req.raw, voiceWebhookUrl(c.env), params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
-	const greeting = `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
+	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
+	const from = params.get("From") ?? "";
+	// Repeat callers get greeted like the twin remembers them — because it does.
+	const mem = await getCaller(c.env, from).catch(() => null);
+	const greeting =
+		mem && mem.call_count > 0
+			? `Hey${mem.name ? ` ${mem.name}` : ""}, it's ${cfg.twinName}'s AI twin again — good to hear from you. What's up?`
+			: `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
 	const callSid = params.get("CallSid") ?? "unknown";
 	await saveConvo(c.env, callSid, [{ role: "assistant", content: greeting }]);
 	await saveTranscript(c.env, callSid, params.get("From"), [{ role: "assistant", content: greeting }]);
+	if (from) {
+		// Count the call and fold any not-yet-summarized past transcripts into
+		// memory (helps the /respond turns of this very call, and the next one).
+		c.executionCtx.waitUntil(touchCaller(c.env, from).catch(() => {}));
+		c.executionCtx.waitUntil(refreshCallerSummary(c.env, from).catch(() => {}));
+	}
+	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	const audio = await speak(c.env, cfg, greeting);
 	return xml(gather(c.env, audio, greeting));
 });
 
 twin.post("/voice/respond", async (c) => {
-	const cfg = await loadCfg(c.env);
+	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
 	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/voice/respond`, params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
+	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
 	const callSid = params.get("CallSid") ?? "unknown";
 	const heard = (params.get("SpeechResult") ?? "").trim();
 	if (!heard) return xml(gather(c.env, null, "Sorry, I didn't catch that. One more time?"));
@@ -482,16 +926,21 @@ twin.post("/voice/respond", async (c) => {
 		);
 	}
 
-	const reply = await personaReply(c.env, cfg, history);
+	const mem = await getCaller(c.env, params.get("From") ?? "").catch(() => null);
+	const facts = await loadFacts(c.env).catch(() => [] as Fact[]);
+	const reply = await personaReply(c.env, cfg, history, factsBlock(cfg.twinName, facts) + callerContext(mem));
 	history.push({ role: "assistant", content: reply });
 	await saveConvo(c.env, callSid, history);
 	await saveTranscript(c.env, callSid, params.get("From"), history);
 
 	const audio = await speak(c.env, cfg, reply);
 	if (/\b(goodbye|bye|talk later|hang up)\b/i.test(heard)) {
+		// Fold this finished call into the caller's memory right away.
+		const caller = params.get("From");
+		if (caller) c.executionCtx.waitUntil(refreshCallerSummary(c.env, caller).catch(() => {}));
 		// Text the owner a summary of the finished call.
 		if (c.env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
-			const from = params.get("From") ?? "unknown";
+			const from = caller ?? "unknown";
 			const body = `Your twin just finished a call with ${from}. Last thing they said: "${heard.slice(0, 200)}". Full transcript: generateai.build/twin`;
 			c.executionCtx.waitUntil(
 				twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
@@ -515,6 +964,7 @@ twin.post("/voice/respond", async (c) => {
 // deploy pipeline after each deploy since the account's cron limit is full.
 twin.get("/wire", async (c) => {
 	const note = await twinAutoFinish(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
+	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	const cfg = await loadCfg(c.env);
 	let numbers: Array<{ phoneNumber: string; voiceUrl: string }> = [];
 	let accountType = "";
@@ -592,33 +1042,151 @@ twin.get("/wire", async (c) => {
 	});
 });
 
-// Inbound SMS to the twin's number. Owner texts "text <number>: <message>"
-// and the twin relays it from its own number; anyone else's text is
+// Inbound SMS to the twin's number. The owner texts it in plain English —
+// "tell Jake I'll be there at 6" resolves the contact and writes the message
+// in the owner's style; "add Jake 9525551234" saves a contact; the explicit
+// "text <number>: <message>" form still works. Anyone else's text is
 // forwarded to the owner's cell.
 twin.post("/sms/incoming", async (c) => {
-	const cfg = await loadCfg(c.env);
+	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
 	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/sms/incoming`, params, cfg.twilioToken))) {
 		return c.text("unauthorized", 401);
 	}
+	cfg = await overlayProfile(c.env, cfg, [params.get("To")]);
 	const from = params.get("From") ?? "";
 	const body = (params.get("Body") ?? "").trim();
 	const send = (to: string, text: string) =>
 		twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", { To: to, From: cfg.twilioNumber, Body: text });
 	if (from === c.env.TWIN_NOTIFY_CELL) {
-		const m = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
-		if (m) {
-			let to = m[1].replace(/\D/g, "");
-			if (to.length === 10) to = "1" + to;
-			await send("+" + to, m[2].trim());
-			await send(from, `Sent to +${to}.`);
-		} else {
-			await send(from, 'To relay a text: "text 9525551234: your message"');
+		// Deterministic fast paths first; Claude handles everything else.
+		const explicit = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
+		const addCmd = body.match(/^(?:add|save)(?:\s+contact)?\s+(.{1,40}?)\s+(\+?[\d\s().-]{10,16})$/i);
+		const rememberCmd = body.match(/^remember[:,]?\s+([\s\S]{3,})$/i);
+		if (rememberCmd) {
+			await addFact(c.env, rememberCmd[1].trim());
+			await send(from, `Got it, I'll remember: ${rememberCmd[1].trim().slice(0, 300)}`);
+		} else if (explicit) {
+			const to = e164(explicit[1]);
+			if (to) {
+				await send(to, explicit[2].trim());
+				await logText(c.env, "out", to, explicit[2].trim());
+				await send(from, `Sent to ${to}.`);
+			} else {
+				await send(from, "That number doesn't look right — use 10 digits or +E.164.");
+			}
+		} else if (addCmd && e164(addCmd[2])) {
+			await upsertContact(c.env, addCmd[1], e164(addCmd[2])!);
+			await send(from, `Saved ${addCmd[1].trim()} → ${e164(addCmd[2])}.`);
+		} else if (body) {
+			await send(from, await smartOwnerSms(c.env, cfg, body));
 		}
 	} else if (c.env.TWIN_NOTIFY_CELL) {
-		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${from}: ${body.slice(0, 500)}`);
+		await logText(c.env, "in", from, body);
+		const contacts = await loadContacts(c.env);
+		const known = contacts.find((k) => k.phone === from);
+		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${known ? `${known.name} (${from})` : from}: ${body.slice(0, 500)}`);
 	}
+	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
 	return c.body("<Response></Response>", 200, { "content-type": "text/xml" });
+});
+
+// --- facts (owner) -------------------------------------------------------------
+
+twin.get("/facts", ownerOnly, async (c) => {
+	return c.json({ facts: await loadFacts(c.env) });
+});
+
+twin.post("/facts", ownerOnly, zValidator("json", z.object({ fact: z.string().min(3).max(500) })), async (c) => {
+	await addFact(c.env, c.req.valid("json").fact);
+	return c.json({ ok: true });
+});
+
+twin.delete("/facts/:id", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	await c.env.DB.prepare("DELETE FROM twin_facts WHERE id = ?").bind(c.req.param("id")).run();
+	return c.json({ ok: true });
+});
+
+// --- contacts (owner) ----------------------------------------------------------
+
+twin.get("/contacts", ownerOnly, async (c) => {
+	return c.json({ contacts: await loadContacts(c.env) });
+});
+
+twin.post(
+	"/contacts",
+	ownerOnly,
+	zValidator(
+		"json",
+		z.object({ name: z.string().min(1).max(60), phone: z.string().min(7).max(20), notes: z.string().max(200).optional() }),
+	),
+	async (c) => {
+		const { name, phone, notes } = c.req.valid("json");
+		const normalized = e164(phone);
+		if (!normalized) return c.json({ error: "bad_phone", message: "Use a 10-digit US number or +E.164." }, 400);
+		await upsertContact(c.env, name, normalized, notes);
+		return c.json({ ok: true, phone: normalized });
+	},
+);
+
+twin.delete("/contacts/:id", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	await c.env.DB.prepare("DELETE FROM twin_contacts WHERE id = ?").bind(c.req.param("id")).run();
+	return c.json({ ok: true });
+});
+
+// Carrier dial codes to forward the owner's personal number's missed calls to
+// the twin, prefilled with the twin's number. Dialed from the personal phone.
+twin.get("/forwarding", ownerOnly, async (c) => {
+	const cfg = await loadCfg(c.env);
+	if (!cfg.twilioNumber) return c.json({ error: "no_number", message: "Pick a phone number for the twin first." }, 400);
+	const digits = cfg.twilioNumber.replace(/\D/g, ""); // 13205551234
+	const ten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+	return c.json({
+		number: cfg.twilioNumber,
+		carriers: [
+			{
+				carrier: "AT&T, T-Mobile & most GSM carriers",
+				activate: [{ label: "Forward missed + busy + unreachable calls", code: `**004*${digits}#` }],
+				deactivate: "##004#",
+			},
+			{
+				carrier: "AT&T / T-Mobile — pick conditions individually",
+				activate: [
+					{ label: "When you don't answer", code: `**61*${digits}#` },
+					{ label: "When your phone is off / no signal", code: `**62*${digits}#` },
+					{ label: "When you're on the other line", code: `**67*${digits}#` },
+				],
+				deactivate: "##004#",
+			},
+			{
+				carrier: "Verizon",
+				activate: [{ label: "Forward missed + busy calls", code: `*71${ten}` }],
+				deactivate: "*73",
+			},
+		],
+		notes: [
+			"Dial the code from your personal phone (the one being forwarded), then press call — the carrier confirms with a tone or banner.",
+			"Only unanswered/busy/unreachable calls forward; calls you pick up are untouched.",
+			"Test it: have someone call your personal number and don't answer — your twin should pick up.",
+			"Forwarded minutes may bill against your carrier plan.",
+		],
+	});
+});
+
+// Public, idempotent digest trigger (like /wire): sends at most one digest per
+// local day, only after the digest hour, and reveals nothing. Point any
+// external scheduler at this URL for a guaranteed nightly send.
+twin.get("/digest/run", async (c) => {
+	const note = await twinNightlyDigest(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
+	return c.json({ ok: true, note });
+});
+
+// Owner-only: send the digest right now regardless of the daily gate.
+twin.post("/digest/send", ownerOnly, async (c) => {
+	const note = await twinNightlyDigest(c.env, true).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
+	return c.json({ ok: note === "sent", note });
 });
 
 // Recent call transcripts for the owner.
@@ -781,16 +1349,29 @@ twin.post(
 );
 
 // Have the twin call someone. It self-identifies as an AI at the start of the
-// call (FCC requirement) — only call people who expect it (TCPA).
+// call (FCC requirement) — only call people who expect it (TCPA). Pass
+// profileId to place the call as one of the extra twins (its number/persona).
 twin.post(
 	"/call",
 	ownerOnly,
-	zValidator("json", z.object({ to: z.string().regex(/^\+\d{8,15}$/, "Use E.164 format, e.g. +15551234567") })),
+	zValidator(
+		"json",
+		z.object({
+			to: z.string().regex(/^\+\d{8,15}$/, "Use E.164 format, e.g. +15551234567"),
+			profileId: z.string().optional(),
+		}),
+	),
 	async (c) => {
-		const cfg = await loadCfg(c.env);
+		let cfg = await loadCfg(c.env);
 		if (!cfg.twilioSid || !cfg.twilioToken) return c.json({ error: "twilio_not_connected" }, 400);
+		const { to, profileId } = c.req.valid("json");
+		if (profileId) {
+			const p = (await loadProfiles(c.env)).find((x) => x.id === profileId);
+			if (!p) return c.json({ error: "profile_not_found" }, 404);
+			if (!p.number) return c.json({ error: "no_number", message: "That twin has no phone number yet." }, 400);
+			cfg = applyProfile(cfg, p);
+		}
 		if (!cfg.twilioNumber) return c.json({ error: "no_number", message: "Pick a phone number first." }, 400);
-		const { to } = c.req.valid("json");
 		const res = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Calls.json", {
 			To: to,
 			From: cfg.twilioNumber,
@@ -803,5 +1384,83 @@ twin.post(
 		return c.json({ ok: true, to });
 	},
 );
+
+// --- multiple twins (owner) ----------------------------------------------------
+
+twin.get("/profiles", ownerOnly, async (c) => {
+	const profiles = await loadProfiles(c.env);
+	return c.json({
+		profiles: profiles.map((p) => ({ id: p.id, name: p.name, persona: p.persona, number: p.number, voiceId: p.voice_id })),
+	});
+});
+
+// Create or update an extra twin. Attach a number either from the account
+// (numberSid) or by buying one (phoneNumber); its voice + SMS webhooks are
+// pointed at this worker, and inbound traffic routes to this twin's persona.
+twin.post(
+	"/profiles",
+	ownerOnly,
+	zValidator(
+		"json",
+		z.object({
+			id: z.string().optional(),
+			name: z.string().min(1).max(40),
+			persona: z.string().min(10).max(4000),
+			voiceId: z.string().min(4).optional(),
+			numberSid: z.string().regex(/^PN[a-f0-9]{32}$/i).optional(),
+			phoneNumber: z.string().regex(/^\+\d{8,15}$/).optional(),
+		}),
+	),
+	async (c) => {
+		const cfg = await loadCfg(c.env);
+		const { id, name, persona, voiceId, numberSid, phoneNumber } = c.req.valid("json");
+		if ((numberSid || phoneNumber) && (!cfg.twilioSid || !cfg.twilioToken)) {
+			return c.json({ error: "twilio_not_connected" }, 400);
+		}
+		let number: string | null = null;
+		if (numberSid || phoneNumber) {
+			const webhook = {
+				VoiceUrl: voiceWebhookUrl(c.env),
+				VoiceMethod: "POST",
+				SmsUrl: `${c.env.APP_URL}/api/twin/sms/incoming`,
+				SmsMethod: "POST",
+			};
+			const res = numberSid
+				? await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${numberSid}.json`, webhook)
+				: await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", { PhoneNumber: phoneNumber!, ...webhook });
+			if (!res.ok) {
+				const msg = (res.data as { message?: string }).message ?? "Twilio refused the request.";
+				return c.json({ error: "twilio_error", message: msg }, 502);
+			}
+			number = (res.data as { phone_number: string }).phone_number;
+			if (number === cfg.twilioNumber) {
+				return c.json({ error: "number_in_use", message: "That's the primary twin's number — pick a different one." }, 400);
+			}
+		}
+		const profileId = id ?? crypto.randomUUID();
+		try {
+			await c.env.DB
+				.prepare(
+					`INSERT INTO twin_profiles (id, name, persona, number, voice_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)
+					 ON CONFLICT(id) DO UPDATE SET name = excluded.name, persona = excluded.persona,
+						number = COALESCE(excluded.number, number), voice_id = COALESCE(excluded.voice_id, voice_id),
+						updated_at = excluded.updated_at`,
+				)
+				.bind(profileId, name, persona, number, voiceId ?? null, Date.now(), Date.now())
+				.run();
+		} catch {
+			return c.json({ error: "number_in_use", message: "Another twin already uses that number." }, 400);
+		}
+		return c.json({ ok: true, id: profileId, number });
+	},
+);
+
+// Remove an extra twin. Its Twilio number stays on the account (release it
+// from the Twilio console if it's no longer wanted).
+twin.delete("/profiles/:id", ownerOnly, async (c) => {
+	await ensureTable(c.env.DB);
+	await c.env.DB.prepare("DELETE FROM twin_profiles WHERE id = ?").bind(c.req.param("id")).run();
+	return c.json({ ok: true });
+});
 
 export default twin;

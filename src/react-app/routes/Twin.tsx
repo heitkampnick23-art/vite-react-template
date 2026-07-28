@@ -8,7 +8,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type TwinOwnedNumber, type TwinVoice } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { CheckCircle2, Circle, Phone, PhoneOutgoing, Mic2, Sparkles } from "lucide-react";
+import { Brain, CheckCircle2, Circle, MessageSquare, Phone, PhoneForwarded, PhoneOutgoing, Mic2, Sparkles, Users, X } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -46,7 +46,14 @@ export function Twin() {
 	const [voices, setVoices] = useState<TwinVoice[] | null>(null);
 	const [persona, setPersona] = useState<string | null>(null);
 	const [callTo, setCallTo] = useState("");
+	const [callAs, setCallAs] = useState("");
 	const [callResult, setCallResult] = useState("");
+	const [contactName, setContactName] = useState("");
+	const [contactPhone, setContactPhone] = useState("");
+	const [newFact, setNewFact] = useState("");
+	const [profileName, setProfileName] = useState("");
+	const [profilePersona, setProfilePersona] = useState("");
+	const [profileNumberSid, setProfileNumberSid] = useState("");
 
 	const refresh = () => qc.invalidateQueries({ queryKey: ["twin-status"] });
 
@@ -85,9 +92,55 @@ export function Twin() {
 		onSuccess: () => refresh(),
 	});
 	const call = useMutation({
-		mutationFn: () => api.twinCall(callTo.trim()),
+		mutationFn: () => api.twinCall(callTo.trim(), callAs || undefined),
 		onSuccess: (d) => setCallResult(`Calling ${d.to} now — pick up and say hi to your twin.`),
 		onError: (e) => setCallResult(errMsg(e)),
+	});
+	const contacts = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
+	const forwarding = useQuery({ queryKey: ["twin-forwarding"], queryFn: api.twinForwarding, retry: false });
+	const facts = useQuery({ queryKey: ["twin-facts"], queryFn: api.twinFacts, retry: false });
+	const addFact = useMutation({
+		mutationFn: () => api.twinAddFact(newFact.trim()),
+		onSuccess: () => {
+			setNewFact("");
+			qc.invalidateQueries({ queryKey: ["twin-facts"] });
+		},
+	});
+	const deleteFact = useMutation({
+		mutationFn: (id: string) => api.twinDeleteFact(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-facts"] }),
+	});
+	const profiles = useQuery({ queryKey: ["twin-profiles"], queryFn: api.twinProfiles, retry: false });
+	const ownedForProfiles = useQuery({ queryKey: ["twin-numbers"], queryFn: api.twinNumbers, retry: false });
+	const saveProfile = useMutation({
+		mutationFn: () =>
+			api.twinSaveProfile({
+				name: profileName.trim(),
+				persona: profilePersona.trim(),
+				numberSid: profileNumberSid || undefined,
+			}),
+		onSuccess: () => {
+			setProfileName("");
+			setProfilePersona("");
+			setProfileNumberSid("");
+			qc.invalidateQueries({ queryKey: ["twin-profiles"] });
+		},
+	});
+	const deleteProfile = useMutation({
+		mutationFn: (id: string) => api.twinDeleteProfile(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-profiles"] }),
+	});
+	const addContact = useMutation({
+		mutationFn: () => api.twinAddContact({ name: contactName.trim(), phone: contactPhone.trim() }),
+		onSuccess: () => {
+			setContactName("");
+			setContactPhone("");
+			qc.invalidateQueries({ queryKey: ["twin-contacts"] });
+		},
+	});
+	const deleteContact = useMutation({
+		mutationFn: (id: string) => api.twinDeleteContact(id),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["twin-contacts"] }),
 	});
 
 	if (status.isLoading) {
@@ -287,11 +340,181 @@ export function Twin() {
 				</p>
 				<div className="mt-3 flex gap-2">
 					<input className={inputCls + " max-w-56"} placeholder="+15551234567" value={callTo} onChange={(e) => setCallTo(e.target.value)} />
+					{(profiles.data?.profiles.filter((p) => p.number).length ?? 0) > 0 && (
+						<select className={inputCls + " max-w-44"} value={callAs} onChange={(e) => setCallAs(e.target.value)}>
+							<option value="">As: primary twin</option>
+							{profiles.data!.profiles.filter((p) => p.number).map((p) => (
+								<option key={p.id} value={p.id}>
+									As: {p.name}
+								</option>
+							))}
+						</select>
+					)}
 					<Button size="sm" disabled={!numberDone || !/^\+\d{8,15}$/.test(callTo.trim()) || call.isPending} onClick={() => call.mutate()}>
 						{call.isPending ? "Dialing…" : "Place call"}
 					</Button>
 				</div>
 				{callResult && <div className="mt-2 text-xs text-zinc-400">{callResult}</div>}
+			</Card>
+
+			{/* Smart texting + contacts */}
+			<Card className="mt-4">
+				<div className="flex items-center gap-2 font-semibold">
+					<MessageSquare className="h-4 w-4" /> Smart texting &amp; contacts
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Text your twin's number in plain English — <i>"tell Jake I'll be there at 6"</i> — and it figures out who you
+					mean, writes the text in your style, and sends it. Save people here or by texting{" "}
+					<i>"add Jake 9525551234"</i> to the twin.
+				</p>
+				<div className="mt-3 flex gap-2">
+					<input className={inputCls + " max-w-44"} placeholder="Name" value={contactName} onChange={(e) => setContactName(e.target.value)} />
+					<input className={inputCls + " max-w-48"} placeholder="9525551234" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} />
+					<Button size="sm" disabled={!contactName.trim() || !contactPhone.trim() || addContact.isPending} onClick={() => addContact.mutate()}>
+						{addContact.isPending ? "Saving…" : "Add"}
+					</Button>
+				</div>
+				{addContact.isError && <div className="mt-1 text-xs text-red-400">{errMsg(addContact.error)}</div>}
+				{contacts.data?.contacts.length === 0 && (
+					<div className="mt-3 text-sm text-zinc-500">No contacts yet.</div>
+				)}
+				{contacts.data?.contacts.map((k) => (
+					<div key={k.id} className="flex items-center justify-between border-b border-white/5 py-2 text-sm last:border-0">
+						<span>
+							{k.name} <span className="ml-2 tabular-nums text-xs text-zinc-500">{k.phone}</span>
+							{k.notes && <span className="ml-2 text-xs text-zinc-600">{k.notes}</span>}
+						</span>
+						<button className="text-zinc-600 hover:text-red-400" title="Remove" onClick={() => deleteContact.mutate(k.id)}>
+							<X className="h-4 w-4" />
+						</button>
+					</div>
+				))}
+			</Card>
+
+			{/* Facts memory */}
+			<Card className="mt-4">
+				<div className="flex items-center gap-2 font-semibold">
+					<Brain className="h-4 w-4" /> Facts about you
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Things your twin knows and uses to answer real questions on calls and texts. Add them here or text the twin{" "}
+					<i>"remember I'm out of town until Friday"</i>.
+				</p>
+				<div className="mt-3 flex gap-2">
+					<input
+						className={inputCls}
+						placeholder="e.g. The garage code for deliveries is 4482"
+						value={newFact}
+						onChange={(e) => setNewFact(e.target.value)}
+						onKeyDown={(e) => e.key === "Enter" && newFact.trim().length >= 3 && addFact.mutate()}
+					/>
+					<Button size="sm" disabled={newFact.trim().length < 3 || addFact.isPending} onClick={() => addFact.mutate()}>
+						{addFact.isPending ? "Saving…" : "Add"}
+					</Button>
+				</div>
+				{addFact.isError && <div className="mt-1 text-xs text-red-400">{errMsg(addFact.error)}</div>}
+				{facts.data?.facts.length === 0 && <div className="mt-3 text-sm text-zinc-500">Nothing yet — the twin only knows its persona.</div>}
+				{facts.data?.facts.map((f) => (
+					<div key={f.id} className="flex items-center justify-between border-b border-white/5 py-2 text-sm last:border-0">
+						<span>{f.fact}</span>
+						<button className="ml-3 shrink-0 text-zinc-600 hover:text-red-400" title="Forget" onClick={() => deleteFact.mutate(f.id)}>
+							<X className="h-4 w-4" />
+						</button>
+					</div>
+				))}
+			</Card>
+
+			{/* Missed-call forwarding */}
+			{forwarding.data && (
+				<Card className="mt-4">
+					<div className="flex items-center gap-2 font-semibold">
+						<PhoneForwarded className="h-4 w-4" /> Forward your missed calls to the twin
+					</div>
+					<p className="mt-1 text-xs text-zinc-500">
+						Dial one code from your personal phone and every call you miss rings your twin (
+						<span className="tabular-nums text-zinc-300">{forwarding.data.number}</span>) instead of voicemail. Calls
+						you answer are untouched.
+					</p>
+					{forwarding.data.carriers.map((cr) => (
+						<div key={cr.carrier} className="mt-3 text-sm">
+							<div className="text-xs font-semibold text-zinc-400">{cr.carrier}</div>
+							{cr.activate.map((a) => (
+								<div key={a.code} className="flex items-center justify-between border-b border-white/5 py-1.5 last:border-0">
+									<span className="text-xs text-zinc-500">{a.label}</span>
+									<code className="ml-3 shrink-0 rounded bg-black/40 px-2 py-0.5 text-xs text-brand-300">{a.code}</code>
+								</div>
+							))}
+							<div className="flex items-center justify-between py-1.5">
+								<span className="text-xs text-zinc-600">Turn off</span>
+								<code className="ml-3 shrink-0 rounded bg-black/40 px-2 py-0.5 text-xs text-zinc-400">{cr.deactivate}</code>
+							</div>
+						</div>
+					))}
+					<ul className="mt-3 list-disc pl-4 text-xs text-zinc-600">
+						{forwarding.data.notes.map((n) => (
+							<li key={n}>{n}</li>
+						))}
+					</ul>
+				</Card>
+			)}
+
+			{/* Multiple twins */}
+			<Card className="mt-4">
+				<div className="flex items-center gap-2 font-semibold">
+					<Users className="h-4 w-4" /> More twins
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Run several twins, each with its own number and personality — a work twin, a screening twin, a joke twin.
+					Calls and texts to each number get that twin's persona; contacts, facts, and your notification cell are
+					shared.
+				</p>
+				{profiles.data?.profiles.map((p) => (
+					<div key={p.id} className="mt-3 flex items-start justify-between rounded-lg border border-white/5 bg-black/20 p-3 text-sm">
+						<div>
+							<div>
+								<b>{p.name}</b>
+								<span className="ml-2 tabular-nums text-xs text-zinc-500">{p.number ?? "no number yet"}</span>
+							</div>
+							<div className="mt-1 line-clamp-2 text-xs text-zinc-500">{p.persona}</div>
+						</div>
+						<button className="ml-3 shrink-0 text-zinc-600 hover:text-red-400" title="Delete twin" onClick={() => deleteProfile.mutate(p.id)}>
+							<X className="h-4 w-4" />
+						</button>
+					</div>
+				))}
+				<div className="mt-4 flex flex-col gap-2">
+					<div className="text-xs text-zinc-400">Add a twin</div>
+					<input className={inputCls + " max-w-56"} placeholder="Name (e.g. Work Nick)" value={profileName} onChange={(e) => setProfileName(e.target.value)} />
+					<textarea
+						className={inputCls + " min-h-20"}
+						placeholder="Personality — how this twin talks and what it handles"
+						value={profilePersona}
+						onChange={(e) => setProfilePersona(e.target.value)}
+					/>
+					<select className={inputCls + " max-w-72"} value={profileNumberSid} onChange={(e) => setProfileNumberSid(e.target.value)}>
+						<option value="">No number yet (attach later)</option>
+						{ownedForProfiles.data?.numbers
+							.filter((n) => n.phoneNumber !== s.twilio.number && !profiles.data?.profiles.some((p) => p.number === n.phoneNumber))
+							.map((n) => (
+								<option key={n.sid} value={n.sid}>
+									{n.phoneNumber}
+								</option>
+							))}
+					</select>
+					<Button
+						size="sm"
+						className="self-start"
+						disabled={!profileName.trim() || profilePersona.trim().length < 10 || saveProfile.isPending}
+						onClick={() => saveProfile.mutate()}
+					>
+						{saveProfile.isPending ? "Creating…" : "Create twin"}
+					</Button>
+					{saveProfile.isError && <div className="text-xs text-red-400">{errMsg(saveProfile.error)}</div>}
+					<p className="text-xs text-zinc-600">
+						Numbers listed are unused ones already on your Twilio account — buy extras in step 2 above, then attach
+						them here.
+					</p>
+				</div>
 			</Card>
 
 			{/* Transcripts */}

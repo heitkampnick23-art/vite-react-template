@@ -14,7 +14,7 @@ import deploy from "./routes/deploy";
 import heal from "./routes/heal";
 import templates from "./routes/templates";
 import secrets from "./routes/secrets";
-import twin, { twinAutoFinish } from "./routes/twin";
+import twin, { twinAutoFinish, twinNightlyDigest } from "./routes/twin";
 import type { AppEnv } from "./middleware/auth";
 
 const app = new Hono<AppEnv>();
@@ -78,6 +78,7 @@ export default {
 		await env.DB.prepare("DELETE FROM oauth_states WHERE expires_at < ?").bind(Date.now()).run();
 		await env.DB.prepare("DELETE FROM magic_links WHERE expires_at < ?").bind(Date.now()).run();
 		await twinAutoFinish(env).catch((e) => console.error("twin autofinish", e));
+		await twinNightlyDigest(env).catch((e) => console.error("twin digest", e));
 	},
 } satisfies ExportedHandler<Env>;
 
