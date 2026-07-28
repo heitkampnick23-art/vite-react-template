@@ -1,0 +1,14 @@
+{
+	"name": "Phone Twin",
+	"short_name": "Phone Twin",
+	"description": "Control your AI phone twins: numbers, personas, contacts, facts, transcripts.",
+	"start_url": "/twin",
+	"scope": "/",
+	"display": "standalone",
+	"background_color": "#09090b",
+	"theme_color": "#09090b",
+	"icons": [
+		{ "src": "/twin-icon-192.png", "sizes": "192x192", "type": "image/png" },
+		{ "src": "/twin-icon-512.png", "sizes": "512x512", "type": "image/png" }
+	]
+}
