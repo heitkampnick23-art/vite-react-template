@@ -646,13 +646,51 @@ async function overlayProfile(env: Env, cfg: TwinCfg, nums: Array<string | null>
 	return hit ? applyProfile(cfg, hit) : cfg;
 }
 
+// Find a voice by word-matching the query against the account's ElevenLabs
+// voices, then the shared library (auto-adding a library match to the
+// account). Every query word must appear in the voice name; if no library
+// name matches, the search's top-ranked result is used.
+async function resolveVoice(cfg: TwinCfg, voiceQuery: string): Promise<string | null> {
+	if (!cfg.elevenKey) return null;
+	const words = voiceQuery.toLowerCase().split(/\s+/).filter(Boolean);
+	const matches = (name: string) => words.every((w) => name.toLowerCase().includes(w));
+	const vr = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
+	if (vr.ok) {
+		const vd = (await vr.json()) as { voices?: Array<{ voice_id: string; name: string }> };
+		const hit = (vd.voices ?? []).find((v) => matches(v.name))?.voice_id;
+		if (hit) return hit;
+	}
+	const sr = await fetch(
+		`https://api.elevenlabs.io/v1/shared-voices?page_size=5&search=${encodeURIComponent(voiceQuery)}`,
+		{ headers: { "xi-api-key": cfg.elevenKey } },
+	);
+	if (!sr.ok) return null;
+	const sd = (await sr.json()) as { voices?: Array<{ public_owner_id: string; voice_id: string; name: string }> };
+	const hit = (sd.voices ?? []).find((v) => matches(v.name)) ?? sd.voices?.[0];
+	if (!hit) return null;
+	const add = await fetch(`https://api.elevenlabs.io/v1/voices/add/${hit.public_owner_id}/${hit.voice_id}`, {
+		method: "POST",
+		headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+		body: JSON.stringify({ new_name: hit.name }),
+	});
+	if (!add.ok) return null;
+	return ((await add.json()) as { voice_id?: string }).voice_id ?? hit.voice_id;
+}
+
 // Stand up twins declared in TWIN_SEED_PROFILES without any UI interaction:
 // attach the named number (swapping the primary onto another owned number if
 // the seed wants the current primary), resolve the voice by name — from the
 // account's voices or, failing that, the ElevenLabs shared library — and text
 // the owner when the twin goes live. Returns "" when there is nothing to do.
 async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
-	let seeds: Array<{ name?: string; number?: string; voiceQuery?: string; persona?: string; voiceSpeed?: number }>;
+	let seeds: Array<{
+		name?: string;
+		number?: string;
+		voiceQuery?: string;
+		persona?: string;
+		voiceSpeed?: number;
+		rev?: number;
+	}>;
 	try {
 		seeds = JSON.parse(String(env.TWIN_SEED_PROFILES || "[]"));
 	} catch {
@@ -667,9 +705,41 @@ async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
 		if (!seed?.name || !seed.persona) continue;
 		const existing = profiles.find((p) => p.name.toLowerCase() === seed.name!.toLowerCase());
 		if (existing) {
-			// The profile itself is never overwritten, but a changed seed
-			// voiceSpeed is applied so voice tuning can ship from a deploy.
-			if (typeof seed.voiceSpeed === "number" && clampSpeed(seed.voiceSpeed) !== existing.voice_speed) {
+			// Never overwrite an existing profile wholesale — but when the seed's
+			// rev is bumped, re-resolve and apply its voice + speed exactly once,
+			// so voice tuning can ship from a deploy. (Persona edits made in the
+			// UI are preserved.)
+			const rev = typeof seed.rev === "number" ? seed.rev : 0;
+			const revKey = `seed_rev:${seed.name.toLowerCase()}`;
+			const stored = Number(
+				(await env.DB.prepare("SELECT value FROM twin_config WHERE key = ?").bind(revKey).first<{ value: string }>())
+					?.value ?? 0,
+			);
+			if (rev > stored) {
+				const voiceId = seed.voiceQuery ? await resolveVoice(cfg, seed.voiceQuery) : null;
+				await env.DB
+					.prepare(
+						"UPDATE twin_profiles SET voice_id = COALESCE(?, voice_id), voice_speed = COALESCE(?, voice_speed), updated_at = ? WHERE id = ?",
+					)
+					.bind(
+						voiceId,
+						typeof seed.voiceSpeed === "number" ? clampSpeed(seed.voiceSpeed) : null,
+						Date.now(),
+						existing.id,
+					)
+					.run();
+				await dbSet(env, revKey, String(rev));
+				if (voiceId && env.TWIN_NOTIFY_CELL && existing.number) {
+					await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+						To: env.TWIN_NOTIFY_CELL,
+						From: existing.number,
+						Body: `${seed.name} has a new voice — call ${existing.number} and hear it.`,
+					});
+				}
+				return `seed: updated ${seed.name} rev ${rev}${voiceId ? "" : " (voice unresolved)"}`;
+			}
+			// Legacy path (no rev in the seed): apply a changed voiceSpeed.
+			if (typeof seed.rev !== "number" && typeof seed.voiceSpeed === "number" && clampSpeed(seed.voiceSpeed) !== existing.voice_speed) {
 				await env.DB
 					.prepare("UPDATE twin_profiles SET voice_speed = ?, updated_at = ? WHERE id = ?")
 					.bind(clampSpeed(seed.voiceSpeed), Date.now(), existing.id)
@@ -695,38 +765,8 @@ async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
 			SmsMethod: "POST",
 		};
 
-		// Resolve the voice: account voices first, then the shared library. A
-		// voice matches when its name contains every word of the query.
-		let voiceId: string | null = null;
-		if (seed.voiceQuery && cfg.elevenKey) {
-			const words = seed.voiceQuery.toLowerCase().split(/\s+/).filter(Boolean);
-			const matches = (name: string) => words.every((w) => name.toLowerCase().includes(w));
-			const vr = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
-			if (vr.ok) {
-				const vd = (await vr.json()) as { voices?: Array<{ voice_id: string; name: string }> };
-				voiceId = (vd.voices ?? []).find((v) => matches(v.name))?.voice_id ?? null;
-			}
-			if (!voiceId) {
-				const sr = await fetch(
-					`https://api.elevenlabs.io/v1/shared-voices?page_size=5&search=${encodeURIComponent(seed.voiceQuery)}`,
-					{ headers: { "xi-api-key": cfg.elevenKey } },
-				);
-				if (sr.ok) {
-					const sd = (await sr.json()) as {
-						voices?: Array<{ public_owner_id: string; voice_id: string; name: string }>;
-					};
-					const hit = (sd.voices ?? []).find((v) => matches(v.name)) ?? sd.voices?.[0];
-					if (hit) {
-						const add = await fetch(`https://api.elevenlabs.io/v1/voices/add/${hit.public_owner_id}/${hit.voice_id}`, {
-							method: "POST",
-							headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
-							body: JSON.stringify({ new_name: hit.name }),
-						});
-						if (add.ok) voiceId = ((await add.json()) as { voice_id?: string }).voice_id ?? hit.voice_id;
-					}
-				}
-			}
-		}
+		// Resolve the voice: account voices first, then the shared library.
+		const voiceId = seed.voiceQuery ? await resolveVoice(cfg, seed.voiceQuery) : null;
 
 		// The seed wants the current primary number: hand the primary role to
 		// another owned number first, or — if there is none — turn the primary
@@ -762,6 +802,7 @@ async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
 				Date.now(),
 			)
 			.run();
+		if (typeof seed.rev === "number") await dbSet(env, `seed_rev:${seed.name.toLowerCase()}`, String(seed.rev));
 		if (env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
 			await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
 				To: env.TWIN_NOTIFY_CELL,
