@@ -1447,6 +1447,151 @@ twin.get("/forwarding", ownerOnly, async (c) => {
 	});
 });
 
+// Full system check: pulls delivery evidence straight from Twilio and turns it
+// into plain-English findings. Also repairs any twin number whose webhooks
+// don't point at this worker.
+twin.get("/syscheck", ownerOnly, async (c) => {
+	const cfg = await loadCfg(c.env);
+	const findings: string[] = [];
+	if (!cfg.twilioSid || !cfg.twilioToken) {
+		return c.json({ findings: ["✗ Twilio isn't connected — calls and texts are down. Reconnect it on Twin Setup."] });
+	}
+	const profiles = await loadProfiles(c.env);
+	const cell = c.env.TWIN_NOTIFY_CELL || "";
+	const voiceUrl = voiceWebhookUrl(c.env);
+	const smsUrl = `${c.env.APP_URL}/api/twin/sms/incoming`;
+
+	// Account
+	const acct = await twilioApi(cfg.twilioSid, cfg.twilioToken, ".json");
+	const acctType = (acct.data as { type?: string }).type ?? "unknown";
+	findings.push(
+		acctType.toLowerCase() === "trial"
+			? "✗ Twilio account is a TRIAL: texts/calls only reach verified numbers and get a trial notice. Upgrade it in the Twilio console."
+			: `✓ Twilio account is ${acctType} (${(acct.data as { status?: string }).status ?? "?"}).`,
+	);
+	findings.push(cell ? `✓ Your cell on file: ${cell}.` : "✗ TWIN_NOTIFY_CELL isn't set — transfers and notifications have nowhere to go.");
+	findings.push(c.env.ANTHROPIC_API_KEY ? "✓ Claude brain connected." : "✗ ANTHROPIC_API_KEY missing — twins can't think.");
+
+	// Numbers + webhook repair
+	const twinNumbers = new Map<string, string>(); // number -> twin name
+	if (cfg.twilioNumber) twinNumbers.set(cfg.twilioNumber, cfg.twinName);
+	for (const p of profiles) if (p.number) twinNumbers.set(p.number, p.name);
+	const ownedRes = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=20");
+	const owned =
+		(ownedRes.data as {
+			incoming_phone_numbers?: Array<{ sid: string; phone_number: string; voice_url?: string; sms_url?: string }>;
+		}).incoming_phone_numbers ?? [];
+	for (const [num, name] of twinNumbers) {
+		const row = owned.find((n) => n.phone_number === num);
+		if (!row) {
+			findings.push(`✗ ${name}'s number ${num} is not on the Twilio account anymore.`);
+			continue;
+		}
+		if (row.voice_url !== voiceUrl || row.sms_url !== smsUrl) {
+			const fix = await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${row.sid}.json`, {
+				VoiceUrl: voiceUrl,
+				VoiceMethod: "POST",
+				SmsUrl: smsUrl,
+				SmsMethod: "POST",
+			});
+			findings.push(
+				fix.ok
+					? `✓ ${name} (${num}): webhooks were wrong — repaired just now. Texts to this number should work again.`
+					: `✗ ${name} (${num}): webhooks are wrong and repair failed.`,
+			);
+		} else {
+			findings.push(`✓ ${name} (${num}): call + text webhooks wired correctly.`);
+		}
+	}
+
+	// Recent messages — the delivery truth, with error decoding
+	type Msg = {
+		to?: string;
+		from?: string;
+		status?: string;
+		error_code?: number | null;
+		error_message?: string | null;
+		date_created?: string;
+		direction?: string;
+		body?: string;
+	};
+	const msgsRes = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json?PageSize=15");
+	const msgs = ((msgsRes.data as { messages?: Msg[] }).messages ?? []).map((m) => ({
+		when: m.date_created ?? "",
+		dir: m.direction ?? "",
+		from: m.from ?? "",
+		to: m.to ?? "",
+		status: m.status ?? "",
+		errorCode: m.error_code ?? null,
+		body: (m.body ?? "").slice(0, 80),
+	}));
+	const explainSms = (code: number, to: string, from: string): string => {
+		if (code === 21610)
+			return `✗ TEXTS BLOCKED: ${to} previously replied STOP to ${from}, so Twilio refuses all texts to it from that number. Fix: from that phone, text START to ${from}.`;
+		if (code === 30034)
+			return `✗ TEXTS FILTERED: ${from} isn't A2P-registered, so US carriers drop its texts. Fix: Twilio Console → Messaging → Regulatory Compliance → register A2P 10DLC (sole-proprietor works for personal use).`;
+		if (code === 30007) return `✗ Text from ${from} to ${to} was filtered by the carrier as spam (error 30007).`;
+		if (code === 30003 || code === 30005) return `✗ Text to ${to} failed — phone unreachable or number doesn't exist (error ${code}).`;
+		return `✗ Text from ${from} to ${to} failed with Twilio error ${code}.`;
+	};
+	const badMsgs = msgs.filter((m) => m.errorCode || m.status === "failed" || m.status === "undelivered");
+	if (!msgsRes.ok) findings.push("✗ Couldn't read the message log from Twilio.");
+	else if (!msgs.length) findings.push("• No texts in the log yet — text one of the twin numbers and re-run this check.");
+	else if (!badMsgs.length) findings.push(`✓ Texts: last ${msgs.length} messages show no delivery failures.`);
+	else {
+		const seen = new Set<string>();
+		for (const m of badMsgs) {
+			const line = m.errorCode
+				? explainSms(m.errorCode, m.to, m.from)
+				: `✗ Text from ${m.from} to ${m.to} is "${m.status}".`;
+			if (!seen.has(line)) {
+				seen.add(line);
+				findings.push(line);
+			}
+		}
+	}
+
+	// Recent calls — did transfers to the owner's cell actually ring?
+	type Call = {
+		to?: string;
+		from?: string;
+		status?: string;
+		duration?: string;
+		direction?: string;
+		start_time?: string;
+	};
+	const callsRes = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Calls.json?PageSize=20");
+	const calls = ((callsRes.data as { calls?: Call[] }).calls ?? []).map((cl) => ({
+		when: cl.start_time ?? "",
+		dir: cl.direction ?? "",
+		from: cl.from ?? "",
+		to: cl.to ?? "",
+		status: cl.status ?? "",
+		seconds: Number(cl.duration ?? 0),
+	}));
+	if (callsRes.ok && cell) {
+		const transfers = calls.filter((cl) => cl.to === cell && cl.dir.startsWith("outbound"));
+		if (!transfers.length) {
+			findings.push(
+				"• No transfer attempts to your cell in the recent call log. If a caller asked for the real you and no call reached your phone, ask them to say it plainly (\"transfer me\" / \"speak to Nick\") and re-run this check.",
+			);
+		} else {
+			const t = transfers[0];
+			if (t.status === "completed" && t.seconds > 0) {
+				findings.push(`✓ Latest transfer to your cell (${t.when}) connected for ${t.seconds}s.`);
+			} else if (t.status === "no-answer" || (t.status === "completed" && t.seconds === 0)) {
+				findings.push(
+					`✗ TRANSFER LOOP LIKELY: the twin DID dial your cell (${t.when}) but the call wasn't answered. If your phone never rang, your carrier's missed-call forwarding is sending the twin's transfer straight back to the twin. Fix: forward with the no-answer-only code (**61* on AT&T/T-Mobile) instead of **004*, or Verizon *71 — and avoid the "unreachable" variant when your phone is often on Do Not Disturb.`,
+				);
+			} else {
+				findings.push(`✗ Latest transfer to your cell ended "${t.status}" — the carrier refused or dropped it.`);
+			}
+		}
+	}
+
+	return c.json({ findings, account: { type: acctType }, recentMessages: msgs.slice(0, 10), recentCalls: calls.slice(0, 10) });
+});
+
 // Public, idempotent digest trigger (like /wire): sends at most one digest per
 // local day, only after the digest hour, and reveals nothing. Point any
 // external scheduler at this URL for a guaranteed nightly send.

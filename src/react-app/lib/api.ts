@@ -94,6 +94,7 @@ export const api = {
 	twinBuyExtraNumber: (area: string) =>
 		req<{ ok: true; number: string }>("/api/twin/numbers/buy", { method: "POST", body: JSON.stringify({ area }) }),
 	twinDigestNow: () => req<{ ok: boolean; note: string }>("/api/twin/digest/send", { method: "POST" }),
+	twinSysCheck: () => req<TwinSysCheck>("/api/twin/syscheck"),
 	twinSearchVoiceLibrary: (q: string) =>
 		req<{ voices: TwinLibraryVoice[] }>(`/api/twin/voices/search?q=${encodeURIComponent(q)}`),
 	twinAddLibraryVoice: (body: { publicOwnerId: string; voiceId: string; name: string }) =>
@@ -121,6 +122,12 @@ export type TwinProfile = {
 	voiceSpeed: number | null;
 };
 export type TwinLibraryVoice = { publicOwnerId: string; voiceId: string; name: string; category: string; description: string };
+export type TwinSysCheck = {
+	findings: string[];
+	account?: { type: string };
+	recentMessages?: Array<{ when: string; dir: string; from: string; to: string; status: string; errorCode: number | null; body: string }>;
+	recentCalls?: Array<{ when: string; dir: string; from: string; to: string; status: string; seconds: number }>;
+};
 export type TwinForwarding = {
 	number: string;
 	twinName: string;
