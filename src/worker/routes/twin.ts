@@ -423,6 +423,11 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 				}
 			}
 		}
+		// Seed declared twins (TWIN_SEED_PROFILES, JSON: [{name, number,
+		// voiceQuery, persona}]) so a twin can be stood up hands-free from a
+		// deploy. Idempotent: a seed whose name already exists is skipped.
+		const seeded = await seedProfiles(env, cfg).catch((e) => `seed error: ${e instanceof Error ? e.message : "unknown"}`);
+		if (seeded) return seeded;
 		// Keep at least one extra (non-primary) number on hand for extra twins
 		// when TWIN_EXTRA_AREA_CODES is configured — tries the codes in order.
 		// Idempotent: once any second number exists, this never buys again.
@@ -631,6 +636,112 @@ async function overlayProfile(env: Env, cfg: TwinCfg, nums: Array<string | null>
 	const profiles = await loadProfiles(env);
 	const hit = profiles.find((p) => p.number && candidates.includes(p.number));
 	return hit ? applyProfile(cfg, hit) : cfg;
+}
+
+// Stand up twins declared in TWIN_SEED_PROFILES without any UI interaction:
+// attach the named number (swapping the primary onto another owned number if
+// the seed wants the current primary), resolve the voice by name — from the
+// account's voices or, failing that, the ElevenLabs shared library — and text
+// the owner when the twin goes live. Returns "" when there is nothing to do.
+async function seedProfiles(env: Env, cfg: TwinCfg): Promise<string> {
+	let seeds: Array<{ name?: string; number?: string; voiceQuery?: string; persona?: string }>;
+	try {
+		seeds = JSON.parse(String(env.TWIN_SEED_PROFILES || "[]"));
+	} catch {
+		return "seed: invalid TWIN_SEED_PROFILES JSON";
+	}
+	if (!Array.isArray(seeds) || !seeds.length) return "";
+	if (!cfg.twilioSid || !cfg.twilioToken) return "";
+	const profiles = await loadProfiles(env);
+
+	for (const seed of seeds) {
+		if (!seed?.name || !seed.persona) continue;
+		if (profiles.some((p) => p.name.toLowerCase() === seed.name!.toLowerCase())) continue;
+		const wanted = seed.number ? e164(seed.number) : null;
+
+		const ownedRes = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=50");
+		if (!ownedRes.ok) return "seed: could not list numbers";
+		const owned =
+			(ownedRes.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string }> })
+				.incoming_phone_numbers ?? [];
+		const target = wanted ? owned.find((n) => n.phone_number === wanted) : undefined;
+		if (wanted && !target) return `seed: ${seed.name} wants ${wanted} but the account doesn't own it`;
+
+		const webhook = {
+			VoiceUrl: voiceWebhookUrl(env),
+			VoiceMethod: "POST",
+			SmsUrl: `${env.APP_URL}/api/twin/sms/incoming`,
+			SmsMethod: "POST",
+		};
+
+		// Resolve the voice: account voices first, then the shared library. A
+		// voice matches when its name contains every word of the query.
+		let voiceId: string | null = null;
+		if (seed.voiceQuery && cfg.elevenKey) {
+			const words = seed.voiceQuery.toLowerCase().split(/\s+/).filter(Boolean);
+			const matches = (name: string) => words.every((w) => name.toLowerCase().includes(w));
+			const vr = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
+			if (vr.ok) {
+				const vd = (await vr.json()) as { voices?: Array<{ voice_id: string; name: string }> };
+				voiceId = (vd.voices ?? []).find((v) => matches(v.name))?.voice_id ?? null;
+			}
+			if (!voiceId) {
+				const sr = await fetch(
+					`https://api.elevenlabs.io/v1/shared-voices?page_size=5&search=${encodeURIComponent(seed.voiceQuery)}`,
+					{ headers: { "xi-api-key": cfg.elevenKey } },
+				);
+				if (sr.ok) {
+					const sd = (await sr.json()) as {
+						voices?: Array<{ public_owner_id: string; voice_id: string; name: string }>;
+					};
+					const hit = (sd.voices ?? []).find((v) => matches(v.name)) ?? sd.voices?.[0];
+					if (hit) {
+						const add = await fetch(`https://api.elevenlabs.io/v1/voices/add/${hit.public_owner_id}/${hit.voice_id}`, {
+							method: "POST",
+							headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+							body: JSON.stringify({ new_name: hit.name }),
+						});
+						if (add.ok) voiceId = ((await add.json()) as { voice_id?: string }).voice_id ?? hit.voice_id;
+					}
+				}
+			}
+		}
+
+		// The seed wants the current primary number: hand the primary role to
+		// another owned number first, or — if there is none — turn the primary
+		// twin itself into this persona instead of creating a profile.
+		if (wanted && wanted === cfg.twilioNumber) {
+			const alt = owned.find(
+				(n) => n.phone_number !== wanted && !profiles.some((p) => p.number === n.phone_number),
+			);
+			if (alt) {
+				await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${alt.sid}.json`, webhook);
+				await dbSet(env, "twilio_number", alt.phone_number);
+			} else {
+				await dbSet(env, "persona", seed.persona);
+				await dbSet(env, "twin_name", seed.name);
+				if (voiceId) await dbSet(env, "eleven_voice", voiceId);
+				return `seed: made ${seed.name} the primary twin on ${wanted}`;
+			}
+		}
+		if (target) await twilioApi(cfg.twilioSid, cfg.twilioToken, `/IncomingPhoneNumbers/${target.sid}.json`, webhook);
+
+		await env.DB
+			.prepare(
+				`INSERT INTO twin_profiles (id, name, persona, number, voice_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)`,
+			)
+			.bind(crypto.randomUUID(), seed.name, seed.persona, wanted, voiceId, Date.now(), Date.now())
+			.run();
+		if (env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
+			await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+				To: env.TWIN_NOTIFY_CELL,
+				From: wanted ?? cfg.twilioNumber,
+				Body: `${seed.name} is live${wanted ? ` on ${wanted}` : ""}${voiceId ? " with its own voice" : " (voice not found — pick one on /twin)"}. Call it and say hi.`,
+			});
+		}
+		return `seeded ${seed.name}${wanted ? ` on ${wanted}` : ""}${voiceId ? "" : " (voice unresolved)"}`;
+	}
+	return "";
 }
 
 // --- Twilio REST helpers -------------------------------------------------------
@@ -1215,14 +1326,25 @@ twin.delete("/contacts/:id", ownerOnly, async (c) => {
 });
 
 // Carrier dial codes to forward the owner's personal number's missed calls to
-// the twin, prefilled with the twin's number. Dialed from the personal phone.
+// a twin, prefilled with that twin's number. Dialed from the personal phone.
+// ?number= picks which twin receives the calls (default: the main twin);
+// only the main number or a profile's number is accepted.
 twin.get("/forwarding", ownerOnly, async (c) => {
 	const cfg = await loadCfg(c.env);
 	if (!cfg.twilioNumber) return c.json({ error: "no_number", message: "Pick a phone number for the twin first." }, 400);
-	const digits = cfg.twilioNumber.replace(/\D/g, ""); // 13205551234
+	const profiles = await loadProfiles(c.env);
+	const requested = c.req.query("number") ?? "";
+	const twinNumbers = [
+		{ name: cfg.twinName, number: cfg.twilioNumber },
+		...profiles.filter((p) => p.number).map((p) => ({ name: p.name, number: p.number! })),
+	];
+	const chosen = twinNumbers.find((t) => t.number === requested) ?? twinNumbers[0];
+	const digits = chosen.number.replace(/\D/g, ""); // 13205551234
 	const ten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
 	return c.json({
-		number: cfg.twilioNumber,
+		number: chosen.number,
+		twinName: chosen.name,
+		targets: twinNumbers,
 		carriers: [
 			{
 				carrier: "AT&T, T-Mobile & most GSM carriers",

@@ -99,7 +99,12 @@ export function Twin() {
 		onError: (e) => setCallResult(errMsg(e)),
 	});
 	const contacts = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
-	const forwarding = useQuery({ queryKey: ["twin-forwarding"], queryFn: api.twinForwarding, retry: false });
+	const [fwdTarget, setFwdTarget] = useState("");
+	const forwarding = useQuery({
+		queryKey: ["twin-forwarding", fwdTarget],
+		queryFn: () => api.twinForwarding(fwdTarget || undefined),
+		retry: false,
+	});
 	const facts = useQuery({ queryKey: ["twin-facts"], queryFn: api.twinFacts, retry: false });
 	const addFact = useMutation({
 		mutationFn: () => api.twinAddFact(newFact.trim()),
@@ -469,10 +474,24 @@ export function Twin() {
 						<PhoneForwarded className="h-4 w-4" /> Forward your missed calls to the twin
 					</div>
 					<p className="mt-1 text-xs text-zinc-500">
-						Dial one code from your personal phone and every call you miss rings your twin (
+						Dial one code from your personal phone and every call you miss rings{" "}
+						<b className="text-zinc-300">{forwarding.data.twinName}</b> (
 						<span className="tabular-nums text-zinc-300">{forwarding.data.number}</span>) instead of voicemail. Calls
 						you answer are untouched.
 					</p>
+					{forwarding.data.targets.length > 1 && (
+						<select
+							className={inputCls + " mt-2 max-w-72"}
+							value={forwarding.data.number}
+							onChange={(e) => setFwdTarget(e.target.value)}
+						>
+							{forwarding.data.targets.map((t) => (
+								<option key={t.number} value={t.number}>
+									Forward to: {t.name} ({t.number})
+								</option>
+							))}
+						</select>
+					)}
 					{forwarding.data.carriers.map((cr) => (
 						<div key={cr.carrier} className="mt-3 text-sm">
 							<div className="text-xs font-semibold text-zinc-400">{cr.carrier}</div>

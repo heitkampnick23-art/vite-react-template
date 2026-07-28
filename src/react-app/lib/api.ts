@@ -82,7 +82,8 @@ export const api = {
 	twinAddContact: (body: { name: string; phone: string; notes?: string }) =>
 		req<{ ok: true; phone: string }>("/api/twin/contacts", { method: "POST", body: JSON.stringify(body) }),
 	twinDeleteContact: (id: string) => req<{ ok: true }>(`/api/twin/contacts/${id}`, { method: "DELETE" }),
-	twinForwarding: () => req<TwinForwarding>("/api/twin/forwarding"),
+	twinForwarding: (number?: string) =>
+		req<TwinForwarding>(`/api/twin/forwarding${number ? `?number=${encodeURIComponent(number)}` : ""}`),
 	twinFacts: () => req<{ facts: TwinFact[] }>("/api/twin/facts"),
 	twinAddFact: (fact: string) => req<{ ok: true }>("/api/twin/facts", { method: "POST", body: JSON.stringify({ fact }) }),
 	twinDeleteFact: (id: string) => req<{ ok: true }>(`/api/twin/facts/${id}`, { method: "DELETE" }),
@@ -114,6 +115,8 @@ export type TwinProfile = { id: string; name: string; persona: string; number: s
 export type TwinLibraryVoice = { publicOwnerId: string; voiceId: string; name: string; category: string; description: string };
 export type TwinForwarding = {
 	number: string;
+	twinName: string;
+	targets: Array<{ name: string; number: string }>;
 	carriers: Array<{ carrier: string; activate: Array<{ label: string; code: string }>; deactivate: string }>;
 	notes: string[];
 };
