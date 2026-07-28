@@ -890,9 +890,7 @@ async function buyExtraNumber(
 
 // --- Twilio webhook signature validation (HMAC-SHA1 of URL + sorted params) ----
 
-async function validTwilioSignature(req: Request, url: string, params: URLSearchParams, authToken: string) {
-	const sig = req.headers.get("X-Twilio-Signature");
-	if (!sig || !authToken) return false;
+async function signFor(url: string, params: URLSearchParams, authToken: string) {
 	const keys = [...params.keys()].sort();
 	let data = url;
 	for (const k of keys) data += k + params.get(k);
@@ -904,8 +902,35 @@ async function validTwilioSignature(req: Request, url: string, params: URLSearch
 		["sign"],
 	);
 	const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
-	const expected = btoa(String.fromCharCode(...new Uint8Array(mac)));
-	return expected === sig;
+	return btoa(String.fromCharCode(...new Uint8Array(mac)));
+}
+
+// Twilio signs the exact URL it called. Checking only the APP_URL-derived URL
+// silently 401s every webhook whenever the two differ (www vs apex, a trailing
+// query string, a proxied scheme) — the twin then looks "dead" with nothing in
+// the logs. Accept the request's own URL too, and record misses so /syscheck
+// can say "Twilio reached us but the signature didn't match".
+async function validTwilioSignature(
+	req: Request,
+	url: string,
+	params: URLSearchParams,
+	authToken: string,
+	env?: Env,
+) {
+	const sig = req.headers.get("X-Twilio-Signature");
+	if (!sig || !authToken) return false;
+	const candidates = [url, req.url, req.url.split("?")[0]];
+	for (const candidate of new Set(candidates)) {
+		if ((await signFor(candidate, params, authToken)) === sig) return true;
+	}
+	if (env) {
+		await env.CACHE.put(
+			"twin:sigfail",
+			JSON.stringify({ at: Date.now(), expected: url, actual: req.url }),
+			{ expirationTtl: 86400 },
+		).catch(() => {});
+	}
+	return false;
 }
 
 // --- ElevenLabs TTS: text → mp3 in KV, returns playable URL (null → <Say>) -----
@@ -1102,11 +1127,18 @@ twin.get("/voice/audio/:id", async (c) => {
 twin.post("/voice/incoming", async (c) => {
 	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
-	if (!(await validTwilioSignature(c.req.raw, voiceWebhookUrl(c.env), params, cfg.twilioToken))) {
+	if (!(await validTwilioSignature(c.req.raw, voiceWebhookUrl(c.env), params, cfg.twilioToken, c.env))) {
 		return c.text("unauthorized", 401);
 	}
 	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
 	const from = params.get("From") ?? "";
+	// A call from one of our own twin numbers is the owner's carrier bouncing a
+	// transfer back at us. Answering it would strand the caller talking to the
+	// twin again; rejecting lets the transfer's no-answer fallback run.
+	const ownNumbers = new Set(
+		[cfg.twilioNumber, ...(await loadProfiles(c.env)).map((p) => p.number)].filter(Boolean) as string[],
+	);
+	if (from && ownNumbers.has(from)) return xml("<Reject/>");
 	// Repeat callers get greeted like the twin remembers them — because it does.
 	const mem = await getCaller(c.env, from).catch(() => null);
 	const greeting =
@@ -1127,10 +1159,45 @@ twin.post("/voice/incoming", async (c) => {
 	return xml(gather(c.env, audio, greeting));
 });
 
+// Whisper played to the owner when a transfer reaches them: press any key to
+// accept. No key (voicemail, or the call forwarded back into the twin) hangs
+// this leg up so the caller gets the take-a-message fallback.
+twin.post("/voice/screen", async (c) => {
+	const cfg = await loadCfg(c.env);
+	const params = new URLSearchParams(await c.req.text());
+	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/voice/screen`, params, cfg.twilioToken, c.env))) {
+		return c.text("unauthorized", 401);
+	}
+	const accept = `${c.env.APP_URL}/api/twin/voice/screen/accept`;
+	return xml(
+		`<Gather numDigits="1" timeout="8" action="${escapeXml(accept)}" method="POST">` +
+			`${SAY}Your A I twin has a caller for you. Press any key to take the call.</Say></Gather><Hangup/>`,
+	);
+});
+
+// A key was pressed: end the whisper with no further TwiML so Twilio bridges
+// the caller through.
+twin.post("/voice/screen/accept", async (c) => {
+	const cfg = await loadCfg(c.env);
+	const params = new URLSearchParams(await c.req.text());
+	if (
+		!(await validTwilioSignature(
+			c.req.raw,
+			`${c.env.APP_URL}/api/twin/voice/screen/accept`,
+			params,
+			cfg.twilioToken,
+			c.env,
+		))
+	) {
+		return c.text("unauthorized", 401);
+	}
+	return xml("");
+});
+
 twin.post("/voice/respond", async (c) => {
 	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
-	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/voice/respond`, params, cfg.twilioToken))) {
+	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/voice/respond`, params, cfg.twilioToken, c.env))) {
 		return c.text("unauthorized", 401);
 	}
 	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
@@ -1171,8 +1238,14 @@ twin.post("/voice/respond", async (c) => {
 		const lead = (await speak(c.env, cfg, msg).then((u) => (u ? `<Play>${escapeXml(u)}</Play>` : null))) ??
 			`${SAY}${escapeXml(msg)}</Say>`;
 		const action = `${c.env.APP_URL}/api/twin/voice/respond`;
+		// Screened transfer: the answering side must press a key to accept. If
+		// the owner's carrier forwards this very call back to the twin (what
+		// **004* forwarding does), nothing presses a key, so the leg hangs up
+		// and we fall through to taking a message instead of looping.
+		const screen = `${c.env.APP_URL}/api/twin/voice/screen`;
 		return xml(
-			`${lead}<Dial callerId="${escapeXml(cfg.twilioNumber)}" timeout="25">${escapeXml(c.env.TWIN_NOTIFY_CELL)}</Dial>` +
+			`${lead}<Dial callerId="${escapeXml(cfg.twilioNumber)}" timeout="25" answerOnBridge="true">` +
+				`<Number url="${escapeXml(screen)}" method="POST">${escapeXml(c.env.TWIN_NOTIFY_CELL)}</Number></Dial>` +
 				`${SAY}Looks like he could not pick up. I can take a message instead.</Say>` +
 				`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" language="en-US"/>`,
 		);
@@ -1302,7 +1375,7 @@ twin.get("/wire", async (c) => {
 twin.post("/sms/incoming", async (c) => {
 	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
-	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/sms/incoming`, params, cfg.twilioToken))) {
+	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/sms/incoming`, params, cfg.twilioToken, c.env))) {
 		return c.text("unauthorized", 401);
 	}
 	cfg = await overlayProfile(c.env, cfg, [params.get("To")]);
@@ -1471,6 +1544,15 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 	);
 	findings.push(cell ? `✓ Your cell on file: ${cell}.` : "✗ TWIN_NOTIFY_CELL isn't set — transfers and notifications have nowhere to go.");
 	findings.push(c.env.ANTHROPIC_API_KEY ? "✓ Claude brain connected." : "✗ ANTHROPIC_API_KEY missing — twins can't think.");
+
+	// Did Twilio reach us but get rejected? That looks exactly like "nothing
+	// happens" from the outside.
+	const sigFail = await c.env.CACHE.get<{ at: number; expected: string; actual: string }>("twin:sigfail", "json");
+	if (sigFail) {
+		findings.push(
+			`✗ A Twilio webhook was rejected for a bad signature (${new Date(sigFail.at).toLocaleString()}). It called ${sigFail.actual} while the twin expected ${sigFail.expected}. Both URLs are now accepted, so re-test — if it recurs, the number's webhook URL needs correcting.`,
+		);
+	}
 
 	// Numbers + webhook repair
 	const twinNumbers = new Map<string, string>(); // number -> twin name
