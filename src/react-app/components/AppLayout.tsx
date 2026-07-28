@@ -88,19 +88,32 @@ export function AppLayout() {
 				</div>
 			</aside>
 			<main className="flex flex-1 flex-col overflow-hidden">
-				<header className="flex h-14 items-center justify-between border-b border-white/5 bg-black/20 px-4 backdrop-blur">
-					<div className="flex items-center gap-3 lg:hidden">
-						<button
-							aria-label={menuOpen ? "Close menu" : "Open menu"}
-							className="rounded-lg p-1.5 text-zinc-300 hover:bg-white/10"
-							onClick={() => setMenuOpen((v) => !v)}
-						>
-							{menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
-						</button>
-						<Logo />
-					</div>
-					<div className="ml-auto flex items-center gap-3">
-						<TokenMeter balance={balance.data?.balance ?? user.tokenBalance} plan={user.plan} />
+				{/* In installed (standalone) mode iOS draws the clock/battery over
+				    the page — reserve that space with the safe-area inset. */}
+				<header
+					className="border-b border-white/5 bg-black/20 px-4 backdrop-blur"
+					style={{ paddingTop: "env(safe-area-inset-top)" }}
+				>
+					<div className="flex h-14 items-center justify-between gap-2">
+						<div className="flex min-w-0 items-center gap-2 lg:hidden">
+							<button
+								aria-label={menuOpen ? "Close menu" : "Open menu"}
+								className="shrink-0 rounded-lg p-1.5 text-zinc-300 hover:bg-white/10"
+								onClick={() => setMenuOpen((v) => !v)}
+							>
+								{menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+							</button>
+							<Logo withText={false} className="shrink-0 sm:hidden" />
+							<Logo className="hidden sm:flex" />
+						</div>
+						<div className="ml-auto flex shrink-0 items-center gap-3">
+							<div className="sm:hidden">
+								<TokenMeter balance={balance.data?.balance ?? user.tokenBalance} plan={user.plan} compact />
+							</div>
+							<div className="hidden sm:block">
+								<TokenMeter balance={balance.data?.balance ?? user.tokenBalance} plan={user.plan} />
+							</div>
+						</div>
 					</div>
 				</header>
 				{menuOpen && (

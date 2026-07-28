@@ -72,7 +72,7 @@ export function Remote() {
 	].filter((t): t is { id: string; name: string; number: string } => !!t.number);
 
 	return (
-		<div className="mx-auto max-w-md p-4 pb-10">
+		<div className="mx-auto max-w-md p-4" style={{ paddingBottom: "calc(2.5rem + env(safe-area-inset-bottom))" }}>
 			{/* Twins */}
 			{twins.map((t) => (
 				<Card key={t.id || "main"} className="mb-3">
