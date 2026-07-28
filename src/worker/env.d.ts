@@ -18,6 +18,9 @@ declare namespace Cloudflare {
 		OWNER_EMAIL: string;
 		// Desired local area code for auto-provisioning the twin's number.
 		TWIN_BUY_AREA_CODE: string;
+		// Comma-separated area codes, in preference order, for keeping one extra
+		// number on the account for additional twins (e.g. "952,651,612").
+		TWIN_EXTRA_AREA_CODES: string;
 		// Twin voice playback speed (ElevenLabs range 0.7–1.2; default 1.12).
 		TWIN_VOICE_SPEED: string;
 		// Owner's preferred ElevenLabs voice id — used when synthesizable.

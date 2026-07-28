@@ -423,6 +423,31 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 				}
 			}
 		}
+		// Keep at least one extra (non-primary) number on hand for extra twins
+		// when TWIN_EXTRA_AREA_CODES is configured — tries the codes in order.
+		// Idempotent: once any second number exists, this never buys again.
+		const extraAreas = String(env.TWIN_EXTRA_AREA_CODES || "")
+			.split(",")
+			.map((s) => s.replace(/\D/g, ""))
+			.filter((s) => s.length === 3);
+		if (extraAreas.length && cfg.twilioNumber) {
+			const owned = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json?PageSize=50");
+			if (owned.ok) {
+				const nums =
+					(owned.data as { incoming_phone_numbers?: Array<{ phone_number: string }> }).incoming_phone_numbers ?? [];
+				if (!nums.some((n) => n.phone_number !== cfg.twilioNumber)) {
+					const res = await buyExtraNumber(env, cfg, extraAreas);
+					if (res.ok && res.number && env.TWIN_NOTIFY_CELL) {
+						await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+							To: env.TWIN_NOTIFY_CELL,
+							From: cfg.twilioNumber,
+							Body: `Bought ${res.number} for your next twin. Attach it in the "More twins" card at generateai.build/twin.`,
+						});
+					}
+					return res.ok ? `bought extra ${res.number}` : `extra number: ${res.note}`;
+				}
+			}
+		}
 	}
 	return "idle";
 }
@@ -635,6 +660,50 @@ async function twilioApi(
 
 function voiceWebhookUrl(env: Env) {
 	return `${env.APP_URL}/api/twin/voice/incoming`;
+}
+
+// Buy one local number, trying area codes in order, with both webhooks pointed
+// here. The number is NOT made the primary twin's — it sits on the account
+// ready to attach to an extra twin. Used by auto-wiring, the owner SMS command
+// ("buy 651 number"), and the More-twins UI.
+async function buyExtraNumber(
+	env: Env,
+	cfg: TwinCfg,
+	areas: string[],
+): Promise<{ ok: boolean; note: string; number?: string }> {
+	if (!cfg.twilioSid || !cfg.twilioToken) return { ok: false, note: "Twilio isn't connected." };
+	let lastNote = "no numbers available";
+	for (const raw of areas) {
+		const area = raw.replace(/\D/g, "").slice(0, 3);
+		if (area.length !== 3) continue;
+		const search = await twilioApi(
+			cfg.twilioSid,
+			cfg.twilioToken,
+			`/AvailablePhoneNumbers/US/Local.json?VoiceEnabled=true&SmsEnabled=true&PageSize=5&AreaCode=${area}`,
+		);
+		const list =
+			(search.data as { available_phone_numbers?: Array<{ phone_number: string }> }).available_phone_numbers ?? [];
+		if (!search.ok || !list.length) {
+			lastNote = `no numbers available in ${area}`;
+			continue;
+		}
+		const buy = await twilioApi(cfg.twilioSid, cfg.twilioToken, "/IncomingPhoneNumbers.json", {
+			PhoneNumber: list[0].phone_number,
+			VoiceUrl: voiceWebhookUrl(env),
+			VoiceMethod: "POST",
+			SmsUrl: `${env.APP_URL}/api/twin/sms/incoming`,
+			SmsMethod: "POST",
+		});
+		if (buy.ok) {
+			return { ok: true, note: "bought", number: (buy.data as { phone_number: string }).phone_number };
+		}
+		const msg = (buy.data as { message?: string }).message ?? `error ${buy.status}`;
+		// Account-level refusals (trial one-number limit, billing) fail for every
+		// area code — stop instead of retrying the rest.
+		if (/only one|upgrade|balance|billing/i.test(msg)) return { ok: false, note: msg };
+		lastNote = msg;
+	}
+	return { ok: false, note: lastNote };
 }
 
 // --- Twilio webhook signature validation (HMAC-SHA1 of URL + sorted params) ----
@@ -1063,7 +1132,16 @@ twin.post("/sms/incoming", async (c) => {
 		const explicit = body.match(/^text\s+(\+?[\d\s().-]{10,16})\s*[:,-]\s*([\s\S]+)$/i);
 		const addCmd = body.match(/^(?:add|save)(?:\s+contact)?\s+(.{1,40}?)\s+(\+?[\d\s().-]{10,16})$/i);
 		const rememberCmd = body.match(/^remember[:,]?\s+([\s\S]{3,})$/i);
-		if (rememberCmd) {
+		const buyCmd = body.match(/^buy\s+(?:a\s+|me\s+)?(\d{3})\s*(?:number)?$/i);
+		if (buyCmd) {
+			const res = await buyExtraNumber(c.env, cfg, [buyCmd[1]]);
+			await send(
+				from,
+				res.ok
+					? `Bought ${res.number}. Attach it to a twin in the "More twins" card at generateai.build/twin.`
+					: `Couldn't buy a ${buyCmd[1]} number: ${res.note}`,
+			);
+		} else if (rememberCmd) {
 			await addFact(c.env, rememberCmd[1].trim());
 			await send(from, `Got it, I'll remember: ${rememberCmd[1].trim().slice(0, 300)}`);
 		} else if (explicit) {
@@ -1273,6 +1351,22 @@ twin.get("/numbers/search", ownerOnly, async (c) => {
 	return c.json({ numbers: list });
 });
 
+// Buy an extra number (not made primary) for use with extra twins. Tries the
+// given area code, falling back through TWIN_EXTRA_AREA_CODES.
+twin.post(
+	"/numbers/buy",
+	ownerOnly,
+	zValidator("json", z.object({ area: z.string().regex(/^\d{3}$/, "Three-digit area code") })),
+	async (c) => {
+		const cfg = await loadCfg(c.env);
+		if (!cfg.twilioSid || !cfg.twilioToken) return c.json({ error: "twilio_not_connected" }, 400);
+		const fallbacks = String(c.env.TWIN_EXTRA_AREA_CODES || "").split(",");
+		const res = await buyExtraNumber(c.env, cfg, [c.req.valid("json").area, ...fallbacks]);
+		if (!res.ok) return c.json({ error: "twilio_error", message: res.note }, 502);
+		return c.json({ ok: true, number: res.number });
+	},
+);
+
 // Activate a number for the twin: either one already owned (numberSid) or buy a
 // new one (phoneNumber). Either way the voice webhook gets pointed at us.
 twin.post(
@@ -1323,6 +1417,50 @@ twin.post(
 		}
 		await cfgSet(c, "eleven_voice", voiceId!);
 		return c.json({ ok: true });
+	},
+);
+
+// Search the public ElevenLabs voice library (shared voices) by name/keyword.
+twin.get("/voices/search", ownerOnly, async (c) => {
+	const cfg = await loadCfg(c.env);
+	if (!cfg.elevenKey) return c.json({ error: "elevenlabs_not_connected" }, 400);
+	const q = (c.req.query("q") ?? "").slice(0, 80);
+	const res = await fetch(`https://api.elevenlabs.io/v1/shared-voices?page_size=10&search=${encodeURIComponent(q)}`, {
+		headers: { "xi-api-key": cfg.elevenKey },
+	});
+	if (!res.ok) return c.json({ error: "elevenlabs_error", message: (await res.text()).slice(0, 300) }, 502);
+	const data = (await res.json()) as {
+		voices?: Array<{ public_owner_id: string; voice_id: string; name: string; category?: string; description?: string }>;
+	};
+	return c.json({
+		voices: (data.voices ?? []).map((v) => ({
+			publicOwnerId: v.public_owner_id,
+			voiceId: v.voice_id,
+			name: v.name,
+			category: v.category ?? "",
+			description: (v.description ?? "").slice(0, 140),
+		})),
+	});
+});
+
+// Add a library voice to the account so it shows up in /voices and can be
+// assigned to a twin.
+twin.post(
+	"/voices/add",
+	ownerOnly,
+	zValidator("json", z.object({ publicOwnerId: z.string().min(8), voiceId: z.string().min(4), name: z.string().min(1).max(80) })),
+	async (c) => {
+		const cfg = await loadCfg(c.env);
+		if (!cfg.elevenKey) return c.json({ error: "elevenlabs_not_connected" }, 400);
+		const { publicOwnerId, voiceId, name } = c.req.valid("json");
+		const res = await fetch(`https://api.elevenlabs.io/v1/voices/add/${publicOwnerId}/${voiceId}`, {
+			method: "POST",
+			headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+			body: JSON.stringify({ new_name: name }),
+		});
+		if (!res.ok) return c.json({ error: "elevenlabs_error", message: (await res.text()).slice(0, 300) }, 502);
+		const data = (await res.json()) as { voice_id?: string };
+		return c.json({ ok: true, voiceId: data.voice_id ?? voiceId });
 	},
 );
 
