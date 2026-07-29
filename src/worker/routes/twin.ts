@@ -97,6 +97,11 @@ async function ensureTable(db: D1Database) {
 				created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 			)`,
 		),
+		db.prepare(
+			`CREATE TABLE IF NOT EXISTS twin_answers (
+				id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL
+			)`,
+		),
 	]);
 	// Older deployments created twin_profiles without voice_speed; add it in
 	// place (no-op error once it exists).
@@ -1127,9 +1132,9 @@ function gather(env: Env, playUrl: string | null, fallbackText: string) {
 	const speech = playUrl ? `<Play>${escapeXml(playUrl)}</Play>` : `${SAY}${escapeXml(fallbackText)}</Say>`;
 	const action = `${env.APP_URL}/api/twin/voice/respond`;
 	return (
-		`${speech}<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
+		`${speech}<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`${SAY}Are you still there?</Say>` +
-		`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
+		`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`<Hangup/>`
 	);
 }
@@ -1280,37 +1285,103 @@ twin.post("/voice/respond", async (c) => {
 			`${lead}<Dial callerId="${escapeXml(cfg.twilioNumber)}" timeout="25" answerOnBridge="true">` +
 				`<Number url="${escapeXml(screen)}" method="POST">${escapeXml(c.env.TWIN_NOTIFY_CELL)}</Number></Dial>` +
 				`${SAY}Looks like he could not pick up. I can take a message instead.</Say>` +
-				`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>`,
+				`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>`,
 		);
 	}
 
-	const reply = await personaReply(c.env, cfg, history, factsBlock(cfg.twinName, facts) + callerContext(mem));
-	history.push({ role: "assistant", content: reply });
-	// Persisting the turn doesn't gate the answer — let it finish in the
-	// background while the caller is already hearing the reply.
-	c.executionCtx.waitUntil(saveConvo(c.env, callSid, history));
-	c.executionCtx.waitUntil(saveTranscript(c.env, callSid, params.get("From"), history));
+	// Answer asynchronously: reply computation (Claude + TTS) runs in the
+	// background while the caller immediately hears a short acknowledgment —
+	// no silent void. The result lands in D1 (strongly consistent, unlike KV
+	// across colos) and /voice/answer picks it up.
+	const ticket = crypto.randomUUID();
+	c.executionCtx.waitUntil(
+		computeAnswer(c.env, cfg, {
+			ticket,
+			callSid,
+			from: params.get("From"),
+			heard,
+			history,
+			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem),
+		}),
+	);
+	const filler = await speak(c.env, cfg, FILLER_LINE); // content-cached — instant after the first call
+	const answerUrl = `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}`;
+	return xml(
+		`${filler ? `<Play>${escapeXml(filler)}</Play>` : '<Pause length="1"/>'}` +
+			`<Redirect method="POST">${escapeXml(answerUrl)}</Redirect>`,
+	);
+});
 
-	const audio = await speak(c.env, cfg, reply);
-	if (/\b(goodbye|bye|talk later|hang up)\b/i.test(heard)) {
-		// Fold this finished call into the caller's memory right away.
-		const caller = params.get("From");
-		if (caller) c.executionCtx.waitUntil(refreshCallerSummary(c.env, caller).catch(() => {}));
-		// Text the owner a summary of the finished call.
-		if (c.env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
-			const from = caller ?? "unknown";
-			const body = `Your twin just finished a call with ${from}. Last thing they said: "${heard.slice(0, 200)}". Full transcript: generateai.build/twin`;
-			c.executionCtx.waitUntil(
-				twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
-					To: c.env.TWIN_NOTIFY_CELL,
-					From: cfg.twilioNumber,
-					Body: body,
-				}).then(() => undefined),
-			);
-		}
-		return xml(audio ? `<Play>${escapeXml(audio)}</Play><Hangup/>` : `${SAY}${escapeXml(reply)}</Say><Hangup/>`);
+const FILLER_LINE = "Mm, one sec.";
+
+type AnswerPayload = { audio: string | null; text: string; hangup: boolean };
+
+async function computeAnswer(
+	env: Env,
+	cfg: TwinCfg,
+	job: { ticket: string; callSid: string; from: string | null; heard: string; history: Turn[]; extraContext: string },
+) {
+	let payload: AnswerPayload;
+	try {
+		const reply = await personaReply(env, cfg, job.history, job.extraContext);
+		job.history.push({ role: "assistant", content: reply });
+		const hangup = /\b(goodbye|bye|talk later|hang up)\b/i.test(job.heard);
+		payload = { audio: await speak(env, cfg, reply), text: reply, hangup };
+	} catch {
+		payload = { audio: null, text: "Sorry, I glitched for a second there. Say that again?", hangup: false };
 	}
-	return xml(gather(c.env, audio, reply));
+	// Hand the answer to /voice/answer before any housekeeping.
+	await env.DB
+		.prepare("INSERT INTO twin_answers (id, payload, created_at) VALUES (?,?,?)")
+		.bind(job.ticket, JSON.stringify(payload), Date.now())
+		.run();
+	await saveConvo(env, job.callSid, job.history);
+	await saveTranscript(env, job.callSid, job.from, job.history);
+	if (payload.hangup) {
+		if (job.from) await refreshCallerSummary(env, job.from).catch(() => {});
+		if (env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
+			await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+				To: env.TWIN_NOTIFY_CELL,
+				From: cfg.twilioNumber,
+				Body: `Your twin just finished a call with ${job.from ?? "unknown"}. Last thing they said: "${job.heard.slice(0, 200)}". Full transcript: generateai.build/twin`,
+			});
+		}
+	}
+	await env.DB.prepare("DELETE FROM twin_answers WHERE created_at < ?").bind(Date.now() - 600_000).run();
+}
+
+// Second half of a turn: the filler line has played; fetch the computed
+// answer, waiting briefly if the model is still writing. A rare long think
+// loops back here with a beat of silence instead of dropping the call.
+twin.post("/voice/answer", async (c) => {
+	let cfg = await loadCfg(c.env);
+	const params = new URLSearchParams(await c.req.text());
+	if (!(await validTwilioSignature(c.req.raw, `${c.env.APP_URL}/api/twin/voice/answer`, params, cfg.twilioToken, c.env))) {
+		return c.text("unauthorized", 401);
+	}
+	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
+	const ticket = c.req.query("t") ?? "";
+	const round = Number(c.req.query("n") ?? 0);
+	for (let i = 0; i < 8; i++) {
+		const row = await c.env.DB
+			.prepare("SELECT payload FROM twin_answers WHERE id = ?")
+			.bind(ticket)
+			.first<{ payload: string }>();
+		if (row) {
+			c.executionCtx.waitUntil(
+				c.env.DB.prepare("DELETE FROM twin_answers WHERE id = ?").bind(ticket).run().then(() => undefined),
+			);
+			const a = JSON.parse(row.payload) as AnswerPayload;
+			if (a.hangup) {
+				return xml(a.audio ? `<Play>${escapeXml(a.audio)}</Play><Hangup/>` : `${SAY}${escapeXml(a.text)}</Say><Hangup/>`);
+			}
+			return xml(gather(c.env, a.audio, a.text));
+		}
+		await new Promise((r) => setTimeout(r, 600));
+	}
+	if (round >= 2) return xml(gather(c.env, null, "Sorry, that took me too long. Say that again?"));
+	const again = `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}&n=${round + 1}`;
+	return xml(`<Pause length="1"/><Redirect method="POST">${escapeXml(again)}</Redirect>`);
 });
 
 // ==============================================================================
