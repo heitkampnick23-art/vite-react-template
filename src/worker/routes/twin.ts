@@ -21,7 +21,9 @@ import { encryptSecret, decryptSecret } from "../lib/crypto";
 
 const twin = new Hono<AppEnv>();
 
-const AUDIO_TTL = 600; // seconds a generated clip stays playable
+// Clips are content-addressed, so a long TTL is what makes stock lines
+// (greetings, retries, the transfer line) replay without re-synthesizing.
+const AUDIO_TTL = 86_400;
 const CONVO_TTL = 3600;
 const MAX_TURNS = 20;
 
@@ -46,7 +48,12 @@ const ownerOnly: MiddlewareHandler<AppEnv> = async (c, next) => {
 
 const SECRET_KEYS = new Set(["twilio_token", "eleven_key"]);
 
+// Schema setup costs six D1 round trips, and it ran on every webhook — pure
+// dead time on a live call. Once per isolate is enough; a cold start redoes it.
+let tablesReady = false;
+
 async function ensureTable(db: D1Database) {
+	if (tablesReady) return;
 	await db.batch([
 		db.prepare(
 			`CREATE TABLE IF NOT EXISTS twin_config (
@@ -94,6 +101,7 @@ async function ensureTable(db: D1Database) {
 	// Older deployments created twin_profiles without voice_speed; add it in
 	// place (no-op error once it exists).
 	await db.prepare("ALTER TABLE twin_profiles ADD COLUMN voice_speed REAL").run().catch(() => {});
+	tablesReady = true;
 }
 
 // Persist the running transcript so the owner can read every conversation later.
@@ -935,16 +943,31 @@ async function validTwilioSignature(
 
 // --- ElevenLabs TTS: text → mp3 in KV, returns playable URL (null → <Say>) -----
 
+// Stable id for a clip: identical text in the same voice reuses the audio
+// instead of paying for synthesis again (greetings, "say that again?", the
+// transfer line — every call starts with one of these).
+async function clipId(voice: string, speed: number, text: string) {
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${voice}|${speed}|${text}`));
+	return [...new Uint8Array(digest)].slice(0, 16).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | null> {
 	if (!cfg.elevenKey || !cfg.elevenVoice) return null;
+	const id = await clipId(cfg.elevenVoice, cfg.voiceSpeed, text);
+	const url = `${env.APP_URL}/api/twin/voice/audio/${id}`;
+	// Already synthesized recently? Skip ElevenLabs entirely.
+	if (await env.CACHE.get(`twin:audio:${id}`, "stream")) return url;
 	const res = await fetch(
-		`https://api.elevenlabs.io/v1/text-to-speech/${cfg.elevenVoice}?output_format=mp3_22050_32`,
+		// eleven_flash_v2_5 is ElevenLabs' low-latency model (~75ms vs turbo's
+		// ~250ms+); optimize_streaming_latency trades a little prosody for a
+		// faster first byte. Both are the right call on an 8kHz phone line.
+		`https://api.elevenlabs.io/v1/text-to-speech/${cfg.elevenVoice}?output_format=mp3_22050_32&optimize_streaming_latency=3`,
 		{
 			method: "POST",
 			headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
 			body: JSON.stringify({
 				text,
-				model_id: "eleven_turbo_v2_5",
+				model_id: env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
 				voice_settings: {
 					stability: 0.5,
 					similarity_boost: 0.85,
@@ -956,9 +979,8 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 		},
 	);
 	if (!res.ok) return null;
-	const id = crypto.randomUUID();
 	await env.CACHE.put(`twin:audio:${id}`, await res.arrayBuffer(), { expirationTtl: AUDIO_TTL });
-	return `${env.APP_URL}/api/twin/voice/audio/${id}`;
+	return url;
 }
 
 // --- Claude persona reply ------------------------------------------------------
@@ -987,7 +1009,7 @@ async function personaReply(env: Env, cfg: TwinCfg, history: Turn[], extraContex
 			extraContext +
 			" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
 		history,
-		200,
+		150,
 	);
 	return reply ?? "Sorry, I glitched for a second there. Say that again?";
 }
@@ -1105,9 +1127,9 @@ function gather(env: Env, playUrl: string | null, fallbackText: string) {
 	const speech = playUrl ? `<Play>${escapeXml(playUrl)}</Play>` : `${SAY}${escapeXml(fallbackText)}</Say>`;
 	const action = `${env.APP_URL}/api/twin/voice/respond`;
 	return (
-		`${speech}<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" language="en-US"/>` +
+		`${speech}<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`${SAY}Are you still there?</Say>` +
-		`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" language="en-US"/>` +
+		`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`<Hangup/>`
 	);
 }
@@ -1146,8 +1168,8 @@ twin.post("/voice/incoming", async (c) => {
 			? `Hey${mem.name ? ` ${mem.name}` : ""}, it's ${cfg.twinName}'s AI twin again — good to hear from you. What's up?`
 			: `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
 	const callSid = params.get("CallSid") ?? "unknown";
-	await saveConvo(c.env, callSid, [{ role: "assistant", content: greeting }]);
-	await saveTranscript(c.env, callSid, params.get("From"), [{ role: "assistant", content: greeting }]);
+	c.executionCtx.waitUntil(saveConvo(c.env, callSid, [{ role: "assistant", content: greeting }]));
+	c.executionCtx.waitUntil(saveTranscript(c.env, callSid, params.get("From"), [{ role: "assistant", content: greeting }]));
 	if (from) {
 		// Count the call and fold any not-yet-summarized past transcripts into
 		// memory (helps the /respond turns of this very call, and the next one).
@@ -1203,9 +1225,20 @@ twin.post("/voice/respond", async (c) => {
 	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
 	const callSid = params.get("CallSid") ?? "unknown";
 	const heard = (params.get("SpeechResult") ?? "").trim();
-	if (!heard) return xml(gather(c.env, null, "Sorry, I didn't catch that. One more time?"));
+	if (!heard) {
+		// Stock line — synthesized once, then served from cache in the twin's
+		// own voice instead of falling back to the robotic <Say>.
+		const retry = "Sorry, I didn't catch that. One more time?";
+		return xml(gather(c.env, await speak(c.env, cfg, retry), retry));
+	}
 
-	const history = await loadConvo(c.env, callSid);
+	// These three are independent — fetching them one after another added a
+	// round trip each to every spoken turn.
+	const [history, mem, facts] = await Promise.all([
+		loadConvo(c.env, callSid),
+		getCaller(c.env, params.get("From") ?? "").catch(() => null),
+		loadFacts(c.env).catch(() => [] as Fact[]),
+	]);
 	history.push({ role: "user", content: heard });
 
 	// The moment a caller asks to be contacted or leaves a message, text the
@@ -1247,16 +1280,16 @@ twin.post("/voice/respond", async (c) => {
 			`${lead}<Dial callerId="${escapeXml(cfg.twilioNumber)}" timeout="25" answerOnBridge="true">` +
 				`<Number url="${escapeXml(screen)}" method="POST">${escapeXml(c.env.TWIN_NOTIFY_CELL)}</Number></Dial>` +
 				`${SAY}Looks like he could not pick up. I can take a message instead.</Say>` +
-				`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" language="en-US"/>`,
+				`<Gather input="speech" action="${action}" method="POST" speechTimeout="auto" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>`,
 		);
 	}
 
-	const mem = await getCaller(c.env, params.get("From") ?? "").catch(() => null);
-	const facts = await loadFacts(c.env).catch(() => [] as Fact[]);
 	const reply = await personaReply(c.env, cfg, history, factsBlock(cfg.twinName, facts) + callerContext(mem));
 	history.push({ role: "assistant", content: reply });
-	await saveConvo(c.env, callSid, history);
-	await saveTranscript(c.env, callSid, params.get("From"), history);
+	// Persisting the turn doesn't gate the answer — let it finish in the
+	// background while the caller is already hearing the reply.
+	c.executionCtx.waitUntil(saveConvo(c.env, callSid, history));
+	c.executionCtx.waitUntil(saveTranscript(c.env, callSid, params.get("From"), history));
 
 	const audio = await speak(c.env, cfg, reply);
 	if (/\b(goodbye|bye|talk later|hang up)\b/i.test(heard)) {
