@@ -26,6 +26,8 @@ declare namespace Cloudflare {
 		TWIN_SEED_PROFILES: string;
 		// Twin voice playback speed (ElevenLabs range 0.7–1.2; default 1.12).
 		TWIN_VOICE_SPEED: string;
+		// ElevenLabs TTS model; defaults to the low-latency eleven_flash_v2_5.
+		TWIN_TTS_MODEL: string;
 		// Owner's preferred ElevenLabs voice id — used when synthesizable.
 		TWIN_VOICE_ID: string;
 		// Owner's cell for after-call SMS summaries (E.164).
