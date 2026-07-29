@@ -15,11 +15,17 @@ Dial from your personal phone, then press call:
 
 | What | Dial |
 | --- | --- |
-| Forward missed + busy + unreachable (recommended) | `**004*TWINNUMBER#` |
-| Only when you don't answer | `**61*TWINNUMBER#` |
-| Only when your phone is off / no signal | `**62*TWINNUMBER#` |
+| **Only when you don't answer (recommended)** | `**61*TWINNUMBER#` |
 | Only when you're on the other line | `**67*TWINNUMBER#` |
+| Only when your phone is off / no signal — *breaks transfers* | `**62*TWINNUMBER#` |
+| Everything at once — *breaks transfers* | `**004*TWINNUMBER#` |
 | **Turn it all off** | `##004#` |
+
+> **Use the "don't answer" code.** `**004*` and `**62*` also forward when your
+> phone is *unreachable*. When a caller asks the twin for the real you, the twin
+> calls your cell — and those codes send that call straight back to the twin, so
+> the caller never reaches you. Switching codes? Dial `##004#` first, then the
+> new one.
 
 ## Verizon
 
@@ -31,6 +37,8 @@ Dial from your personal phone, then press call:
 ## Notes
 
 - The carrier confirms activation with a tone, banner, or short message.
+- When a transfer reaches you, your phone asks you to **press any key** to take
+  the call — that keypress is what stops a forwarded-back call from looping.
 - To test: call your personal number from another phone and let it ring out —
   the twin should answer, disclose it's an AI, and take the call.
 - Voicemail: while forwarding is active, missed calls go to the twin instead

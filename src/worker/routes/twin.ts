@@ -1490,18 +1490,22 @@ twin.get("/forwarding", ownerOnly, async (c) => {
 		number: chosen.number,
 		twinName: chosen.name,
 		targets: twinNumbers,
+		// No-answer-only (**61*) is the recommended code. The catch-all **004*
+		// also forwards "unreachable", which swallows the twin's own transfer
+		// call back to the owner — dial that one and asking for the real person
+		// stops working.
 		carriers: [
 			{
 				carrier: "AT&T, T-Mobile & most GSM carriers",
-				activate: [{ label: "Forward missed + busy + unreachable calls", code: `**004*${digits}#` }],
+				activate: [{ label: "When you don't answer (recommended)", code: `**61*${digits}#` }],
 				deactivate: "##004#",
 			},
 			{
-				carrier: "AT&T / T-Mobile — pick conditions individually",
+				carrier: "AT&T / T-Mobile — also forward these",
 				activate: [
-					{ label: "When you don't answer", code: `**61*${digits}#` },
-					{ label: "When your phone is off / no signal", code: `**62*${digits}#` },
 					{ label: "When you're on the other line", code: `**67*${digits}#` },
+					{ label: "Phone off / no signal — breaks call transfers", code: `**62*${digits}#` },
+					{ label: "Everything at once — breaks call transfers", code: `**004*${digits}#` },
 				],
 				deactivate: "##004#",
 			},
@@ -1513,7 +1517,9 @@ twin.get("/forwarding", ownerOnly, async (c) => {
 		],
 		notes: [
 			"Dial the code from your personal phone (the one being forwarded), then press call — the carrier confirms with a tone or banner.",
-			"Only unanswered/busy/unreachable calls forward; calls you pick up are untouched.",
+			"Only unanswered/busy calls forward; calls you pick up are untouched.",
+			'Use the "don\'t answer" code. The catch-all **004* also forwards when your phone is unreachable, which sends the twin\'s own transfer call back to the twin — so callers asking for the real you never get through.',
+			"Switching codes? Dial the off code first (##004# or *73), then the new one.",
 			"Test it: have someone call your personal number and don't answer — your twin should pick up.",
 			"Forwarded minutes may bill against your carrier plan.",
 		],
