@@ -992,6 +992,57 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 
 type Turn = { role: "user" | "assistant"; content: string };
 
+// Streaming variant: reads Claude's SSE token stream and fires
+// onFirstSentence as soon as the first complete sentence exists, so its audio
+// can synthesize (and start playing) while the rest of the reply is still
+// being written. Returns the full reply text.
+async function claudeStream(
+	env: Env,
+	system: string,
+	messages: Turn[],
+	maxTokens: number,
+	onFirstSentence: (sentence: string) => Promise<void>,
+): Promise<string | null> {
+	const res = await fetch("https://api.anthropic.com/v1/messages", {
+		method: "POST",
+		headers: {
+			"x-api-key": env.ANTHROPIC_API_KEY,
+			"anthropic-version": "2023-06-01",
+			"content-type": "application/json",
+		},
+		body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: maxTokens, system, messages, stream: true }),
+	});
+	if (!res.ok || !res.body) return null;
+	const reader = res.body.getReader();
+	const dec = new TextDecoder();
+	let buf = "";
+	let text = "";
+	let firstFired: Promise<void> | null = null;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buf += dec.decode(value, { stream: true });
+		const lines = buf.split("\n");
+		buf = lines.pop() ?? "";
+		for (const line of lines) {
+			if (!line.startsWith("data: ")) continue;
+			try {
+				const ev = JSON.parse(line.slice(6)) as { type?: string; delta?: { type?: string; text?: string } };
+				if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") text += ev.delta.text ?? "";
+			} catch {
+				// partial JSON across chunks lands in buf next round
+			}
+		}
+		if (!firstFired && text.length >= 20) {
+			// A sentence boundary at least 15 chars in, followed by whitespace.
+			const m = text.match(/^[\s\S]{15,}?[.!?]["')\]]*(?=\s)/);
+			if (m) firstFired = onFirstSentence(m[0].trim()).catch(() => {});
+		}
+	}
+	if (firstFired) await firstFired;
+	return text.trim() || null;
+}
+
 async function claude(env: Env, system: string, messages: Turn[], maxTokens = 300): Promise<string | null> {
 	const res = await fetch("https://api.anthropic.com/v1/messages", {
 		method: "POST",
@@ -1007,17 +1058,14 @@ async function claude(env: Env, system: string, messages: Turn[], maxTokens = 30
 	return data.content?.find((b) => b.type === "text")?.text?.trim() || null;
 }
 
-async function personaReply(env: Env, cfg: TwinCfg, history: Turn[], extraContext = ""): Promise<string> {
-	const reply = await claude(
-		env,
+function callSystem(cfg: TwinCfg, extraContext: string) {
+	return (
 		cfg.persona +
-			extraContext +
-			" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye.",
-		history,
-		150,
+		extraContext +
+		" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye."
 	);
-	return reply ?? "Sorry, I glitched for a second there. Say that again?";
 }
+
 
 // --- smart texting: owner texts the twin in plain English ----------------------
 //
@@ -1128,15 +1176,20 @@ function escapeXml(s: string) {
 
 const SAY = '<Say voice="Polly.Matthew">'; // fallback voice until ElevenLabs is configured
 
-function gather(env: Env, playUrl: string | null, fallbackText: string) {
-	const speech = playUrl ? `<Play>${escapeXml(playUrl)}</Play>` : `${SAY}${escapeXml(fallbackText)}</Say>`;
+// The listening tail every answer ends with: gather speech, nudge once, hang up.
+function gatherTail(env: Env) {
 	const action = `${env.APP_URL}/api/twin/voice/respond`;
 	return (
-		`${speech}<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
+		`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`${SAY}Are you still there?</Say>` +
 		`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`<Hangup/>`
 	);
+}
+
+function gather(env: Env, playUrl: string | null, fallbackText: string) {
+	const speech = playUrl ? `<Play>${escapeXml(playUrl)}</Play>` : `${SAY}${escapeXml(fallbackText)}</Say>`;
+	return speech + gatherTail(env);
 }
 
 // ==============================================================================
@@ -1304,40 +1357,76 @@ twin.post("/voice/respond", async (c) => {
 			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem),
 		}),
 	);
-	const filler = await speak(c.env, cfg, FILLER_LINE); // content-cached — instant after the first call
+	// Straight to /voice/answer — the redirect round trip itself is the only
+	// gap. Fillers only play when the answer genuinely isn't ready yet.
 	const answerUrl = `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}`;
-	return xml(
-		`${filler ? `<Play>${escapeXml(filler)}</Play>` : '<Pause length="1"/>'}` +
-			`<Redirect method="POST">${escapeXml(answerUrl)}</Redirect>`,
-	);
+	return xml(`<Redirect method="POST">${escapeXml(answerUrl)}</Redirect>`);
 });
 
-const FILLER_LINE = "Mm, one sec.";
+// Spoken only when a turn is genuinely slow, rotated so it never becomes the
+// twin's catchphrase. Clips are content-cached after first synthesis.
+const FILLERS = ["Mm-hm.", "Right — hang on.", "Let me think.", "Okay, one sec."];
+function pickFiller(seed: string) {
+	let h = 0;
+	for (const ch of seed) h = (h * 31 + ch.charCodeAt(0)) | 0;
+	return FILLERS[Math.abs(h) % FILLERS.length];
+}
 
-type AnswerPayload = { audio: string | null; text: string; hangup: boolean };
+// Answers are delivered in segments: [0] is the reply's first sentence,
+// synthesized while Claude is still writing the rest; done=false means more
+// segments are coming. Empty clips with done=true → fall back to <Say>.
+type AnswerPayload = { clips: string[]; text: string; done: boolean; hangup: boolean };
+
+async function putAnswer(env: Env, ticket: string, payload: AnswerPayload) {
+	await env.DB
+		.prepare("INSERT OR REPLACE INTO twin_answers (id, payload, created_at) VALUES (?,?,?)")
+		.bind(ticket, JSON.stringify(payload), Date.now())
+		.run();
+}
 
 async function computeAnswer(
 	env: Env,
 	cfg: TwinCfg,
 	job: { ticket: string; callSid: string; from: string | null; heard: string; history: Turn[]; extraContext: string },
 ) {
-	let payload: AnswerPayload;
+	const hangup = /\b(goodbye|bye|talk later|hang up)\b/i.test(job.heard);
+	const clips: string[] = [];
+	let first = "";
+	let reply: string | null = null;
 	try {
-		const reply = await personaReply(env, cfg, job.history, job.extraContext);
-		job.history.push({ role: "assistant", content: reply });
-		const hangup = /\b(goodbye|bye|talk later|hang up)\b/i.test(job.heard);
-		payload = { audio: await speak(env, cfg, reply), text: reply, hangup };
+		// Stream the reply: the first complete sentence gets voiced and handed
+		// to /voice/answer immediately, so the caller hears the twin start
+		// talking while the rest of the reply is still being generated.
+		reply = await claudeStream(env, callSystem(cfg, job.extraContext), job.history, 150, async (sentence) => {
+			const url = await speak(env, cfg, sentence);
+			if (url) {
+				first = sentence;
+				clips.push(url);
+				await putAnswer(env, job.ticket, { clips: [...clips], text: sentence, done: false, hangup });
+			}
+		});
 	} catch {
-		payload = { audio: null, text: "Sorry, I glitched for a second there. Say that again?", hangup: false };
+		reply = null;
 	}
-	// Hand the answer to /voice/answer before any housekeeping.
-	await env.DB
-		.prepare("INSERT INTO twin_answers (id, payload, created_at) VALUES (?,?,?)")
-		.bind(job.ticket, JSON.stringify(payload), Date.now())
-		.run();
+	if (!reply) {
+		const text = first || "Sorry, I glitched for a second there. Say that again?";
+		await putAnswer(env, job.ticket, { clips: [...clips], text, done: true, hangup: false });
+		return;
+	}
+	// Voice whatever follows the already-spoken first sentence.
+	const idx = first ? reply.indexOf(first) : -1;
+	const rest = idx >= 0 ? reply.slice(idx + first.length).trim() : first ? "" : reply;
+	if (rest) {
+		const url = await speak(env, cfg, rest);
+		if (url) clips.push(url);
+		else clips.length = 0; // partial audio would truncate the reply — Say it all instead
+	}
+	await putAnswer(env, job.ticket, { clips: [...clips], text: reply, done: true, hangup });
+
+	job.history.push({ role: "assistant", content: reply });
 	await saveConvo(env, job.callSid, job.history);
 	await saveTranscript(env, job.callSid, job.from, job.history);
-	if (payload.hangup) {
+	if (hangup) {
 		if (job.from) await refreshCallerSummary(env, job.from).catch(() => {});
 		if (env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
 			await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
@@ -1350,9 +1439,10 @@ async function computeAnswer(
 	await env.DB.prepare("DELETE FROM twin_answers WHERE created_at < ?").bind(Date.now() - 600_000).run();
 }
 
-// Second half of a turn: the filler line has played; fetch the computed
-// answer, waiting briefly if the model is still writing. A rare long think
-// loops back here with a beat of silence instead of dropping the call.
+// Delivers the computed answer segment by segment as it materializes: plays
+// clip i, then redirects for clip i+1 until done. Only speaks a (rotating)
+// filler when nothing is ready yet; rare long thinks get a beat of silence
+// instead of a dropped call.
 twin.post("/voice/answer", async (c) => {
 	let cfg = await loadCfg(c.env);
 	const params = new URLSearchParams(await c.req.text());
@@ -1362,26 +1452,44 @@ twin.post("/voice/answer", async (c) => {
 	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
 	const ticket = c.req.query("t") ?? "";
 	const round = Number(c.req.query("n") ?? 0);
-	for (let i = 0; i < 8; i++) {
+	const seg = Number(c.req.query("i") ?? 0);
+	const next = (n: number, i: number) => `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}&n=${n}&i=${i}`;
+	const cleanup = () =>
+		c.executionCtx.waitUntil(
+			c.env.DB.prepare("DELETE FROM twin_answers WHERE id = ?").bind(ticket).run().then(() => undefined),
+		);
+
+	// First visit polls briefly (the first sentence usually lands fast);
+	// follow-ups wait longer before conceding another filler/pause.
+	const beats = round === 0 && seg === 0 ? 4 : 8;
+	for (let k = 0; k < beats; k++) {
 		const row = await c.env.DB
 			.prepare("SELECT payload FROM twin_answers WHERE id = ?")
 			.bind(ticket)
 			.first<{ payload: string }>();
 		if (row) {
-			c.executionCtx.waitUntil(
-				c.env.DB.prepare("DELETE FROM twin_answers WHERE id = ?").bind(ticket).run().then(() => undefined),
-			);
 			const a = JSON.parse(row.payload) as AnswerPayload;
-			if (a.hangup) {
-				return xml(a.audio ? `<Play>${escapeXml(a.audio)}</Play><Hangup/>` : `${SAY}${escapeXml(a.text)}</Say><Hangup/>`);
+			if (a.clips.length > seg) {
+				const play = `<Play>${escapeXml(a.clips[seg])}</Play>`;
+				if (a.done && seg === a.clips.length - 1) {
+					cleanup();
+					return xml(a.hangup ? `${play}<Hangup/>` : play + gatherTail(c.env));
+				}
+				return xml(`${play}<Redirect method="POST">${escapeXml(next(round, seg + 1))}</Redirect>`);
 			}
-			return xml(gather(c.env, a.audio, a.text));
+			if (a.done) {
+				cleanup();
+				if (seg > 0) return xml(a.hangup ? "<Hangup/>" : gatherTail(c.env));
+				return xml(a.hangup ? `${SAY}${escapeXml(a.text)}</Say><Hangup/>` : gather(c.env, null, a.text));
+			}
 		}
 		await new Promise((r) => setTimeout(r, 600));
 	}
-	if (round >= 2) return xml(gather(c.env, null, "Sorry, that took me too long. Say that again?"));
-	const again = `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}&n=${round + 1}`;
-	return xml(`<Pause length="1"/><Redirect method="POST">${escapeXml(again)}</Redirect>`);
+	if (round >= 3) return xml(gather(c.env, null, "Sorry, that took me too long. Say that again?"));
+	// Not ready: one spoken filler the first time, silence after that.
+	const filler = round === 0 ? await speak(c.env, cfg, pickFiller(ticket)) : null;
+	const wait = filler ? `<Play>${escapeXml(filler)}</Play>` : '<Pause length="1"/>';
+	return xml(`${wait}<Redirect method="POST">${escapeXml(next(round + 1, seg))}</Redirect>`);
 });
 
 // ==============================================================================
