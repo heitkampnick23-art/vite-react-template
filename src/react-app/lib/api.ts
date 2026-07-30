@@ -95,6 +95,16 @@ export const api = {
 		req<{ ok: true; number: string }>("/api/twin/numbers/buy", { method: "POST", body: JSON.stringify({ area }) }),
 	twinDigestNow: () => req<{ ok: boolean; note: string }>("/api/twin/digest/send", { method: "POST" }),
 	twinSysCheck: () => req<TwinSysCheck>("/api/twin/syscheck"),
+	twinA2pRegister: (body: {
+		firstName: string;
+		lastName: string;
+		email: string;
+		phone: string;
+		street: string;
+		city: string;
+		region: string;
+		postalCode: string;
+	}) => req<TwinA2pResult>("/api/twin/a2p/register", { method: "POST", body: JSON.stringify(body) }),
 	twinSearchVoiceLibrary: (q: string) =>
 		req<{ voices: TwinLibraryVoice[] }>(`/api/twin/voices/search?q=${encodeURIComponent(q)}`),
 	twinAddLibraryVoice: (body: { publicOwnerId: string; voiceId: string; name: string }) =>
@@ -122,6 +132,7 @@ export type TwinProfile = {
 	voiceSpeed: number | null;
 };
 export type TwinLibraryVoice = { publicOwnerId: string; voiceId: string; name: string; category: string; description: string };
+export type TwinA2pResult = { steps: Array<{ step: string; ok: boolean; note: string }>; done: boolean; next: string };
 export type TwinSysCheck = {
 	findings: string[];
 	account?: { type: string };

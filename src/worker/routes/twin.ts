@@ -901,6 +901,258 @@ async function buyExtraNumber(
 	return { ok: false, note: lastNote };
 }
 
+// --- A2P 10DLC registration (sole proprietor), driven via Twilio's API --------
+//
+// US carriers drop texts from unregistered local numbers (error 30034). This
+// walks the whole Sole Proprietor registration server-side with the stored
+// credentials: starter customer profile → sole-prop trust product → brand
+// (Twilio texts the owner an OTP link) → messaging service with both twin
+// numbers → campaign. Every created resource SID is persisted in twin_config,
+// so the flow is resumable — rerun it after fixing an error or tapping the
+// OTP link and it picks up where it left off.
+
+async function twilioForm(
+	sid: string,
+	token: string,
+	url: string,
+	body?: Record<string, string | string[]>,
+	method?: "GET" | "POST",
+): Promise<{ ok: boolean; status: number; data: Record<string, unknown> }> {
+	const params = new URLSearchParams();
+	for (const [k, v] of Object.entries(body ?? {})) {
+		if (Array.isArray(v)) for (const item of v) params.append(k, item);
+		else params.append(k, v);
+	}
+	const res = await fetch(url, {
+		method: method ?? (body ? "POST" : "GET"),
+		headers: {
+			Authorization: twilioAuth(sid, token),
+			...(body ? { "content-type": "application/x-www-form-urlencoded" } : {}),
+		},
+		body: body ? params : undefined,
+	});
+	const data = ((await res.json().catch(() => ({}))) ?? {}) as Record<string, unknown>;
+	return { ok: res.ok, status: res.status, data };
+}
+
+async function cfgGet(env: Env, key: string): Promise<string> {
+	await ensureTable(env.DB);
+	const row = await env.DB.prepare("SELECT value FROM twin_config WHERE key = ?").bind(key).first<{ value: string }>();
+	return row?.value ?? "";
+}
+
+const TRUSTHUB = "https://trusthub.twilio.com/v1";
+const MESSAGING = "https://messaging.twilio.com/v1";
+// Twilio's published policy SIDs for the starter profile and sole-prop trust product.
+const STARTER_PROFILE_POLICY = "RN806dd6cd175f314e1f96a9727ee271f4";
+const SOLE_PROP_POLICY = "RNb0d4771c2c98518d916a3d4cd70a8f8b";
+
+type A2pStep = { step: string; ok: boolean; note: string };
+
+async function a2pRegister(
+	env: Env,
+	cfg: TwinCfg,
+	info: { firstName: string; lastName: string; email: string; phone: string; street: string; city: string; region: string; postalCode: string },
+): Promise<{ steps: A2pStep[]; done: boolean; next: string }> {
+	const steps: A2pStep[] = [];
+	const S = cfg.twilioSid;
+	const T = cfg.twilioToken;
+	const err = (d: Record<string, unknown>, status: number) => String(d.message ?? `HTTP ${status}`);
+	// Runs one create-step: reuse the stored SID, otherwise call Twilio and
+	// persist the returned SID. Returns "" on failure (recorded in steps).
+	const ensure = async (key: string, label: string, make: () => Promise<{ ok: boolean; status: number; data: Record<string, unknown> }>, sidField = "sid"): Promise<string> => {
+		const existing = await cfgGet(env, key);
+		if (existing) {
+			steps.push({ step: label, ok: true, note: "already done" });
+			return existing;
+		}
+		const res = await make();
+		const sid = String(res.data[sidField] ?? "");
+		if (!res.ok || !sid) {
+			steps.push({ step: label, ok: false, note: err(res.data, res.status) });
+			return "";
+		}
+		await dbSet(env, key, sid);
+		steps.push({ step: label, ok: true, note: sid });
+		return sid;
+	};
+
+	// 1. Street address (carrier requirement).
+	const addressSid = await ensure("a2p_address", "Street address", () =>
+		twilioForm(S, T, `https://api.twilio.com/2010-04-01/Accounts/${S}/Addresses.json`, {
+			CustomerName: `${info.firstName} ${info.lastName}`,
+			Street: info.street,
+			City: info.city,
+			Region: info.region,
+			PostalCode: info.postalCode,
+			IsoCountry: "US",
+			FriendlyName: "Twin owner address",
+		}),
+	);
+	if (!addressSid) return { steps, done: false, next: "Fix the address fields and rerun." };
+
+	// 2. Starter customer profile: person end-user + address doc, evaluated + submitted.
+	const endUserSid = await ensure("a2p_enduser", "Owner identity", () =>
+		twilioForm(S, T, `${TRUSTHUB}/EndUsers`, {
+			FriendlyName: "Twin owner",
+			Type: "starter_customer_profile_information",
+			Attributes: JSON.stringify({
+				first_name: info.firstName,
+				last_name: info.lastName,
+				email: info.email,
+				phone_number: info.phone,
+			}),
+		}),
+	);
+	const docSid = endUserSid
+		? await ensure("a2p_doc", "Address document", () =>
+				twilioForm(S, T, `${TRUSTHUB}/SupportingDocuments`, {
+					FriendlyName: "Twin owner address",
+					Type: "customer_profile_address",
+					Attributes: JSON.stringify({ address_sids: [addressSid] }),
+				}),
+			)
+		: "";
+	const profileSid = docSid
+		? await ensure("a2p_profile", "Customer profile", () =>
+				twilioForm(S, T, `${TRUSTHUB}/CustomerProfiles`, {
+					FriendlyName: "Twin owner profile",
+					Email: info.email,
+					PolicySid: STARTER_PROFILE_POLICY,
+				}),
+			)
+		: "";
+	if (!profileSid) return { steps, done: false, next: "Fix the failed step above and rerun." };
+	if (!(await cfgGet(env, "a2p_profile_submitted"))) {
+		for (const objectSid of [endUserSid, docSid]) {
+			const assign = await twilioForm(S, T, `${TRUSTHUB}/CustomerProfiles/${profileSid}/EntityAssignments`, {
+				ObjectSid: objectSid,
+			});
+			if (!assign.ok && assign.status !== 409 && !/already/i.test(err(assign.data, assign.status))) {
+				steps.push({ step: "Attach profile details", ok: false, note: err(assign.data, assign.status) });
+				return { steps, done: false, next: "Rerun to retry." };
+			}
+		}
+		const submit = await twilioForm(S, T, `${TRUSTHUB}/CustomerProfiles/${profileSid}`, { Status: "pending-review" });
+		if (!submit.ok && !/already|in-review|approved/i.test(err(submit.data, submit.status))) {
+			steps.push({ step: "Submit profile", ok: false, note: err(submit.data, submit.status) });
+			return { steps, done: false, next: "Rerun to retry." };
+		}
+		await dbSet(env, "a2p_profile_submitted", "1");
+		steps.push({ step: "Submit profile", ok: true, note: "submitted" });
+	} else steps.push({ step: "Submit profile", ok: true, note: "already done" });
+
+	// 3. Sole-proprietor trust product (brand identity + the OTP mobile number).
+	const spEndUser = await ensure("a2p_sp_enduser", "Brand identity", () =>
+		twilioForm(S, T, `${TRUSTHUB}/EndUsers`, {
+			FriendlyName: "Twin sole prop",
+			Type: "sole_proprietor_information",
+			Attributes: JSON.stringify({
+				brand_name: `${info.firstName} ${info.lastName}`,
+				vertical: "TECHNOLOGY",
+				mobile_phone_number: info.phone,
+			}),
+		}),
+	);
+	const trustSid = spEndUser
+		? await ensure("a2p_trust", "Trust product", () =>
+				twilioForm(S, T, `${TRUSTHUB}/TrustProducts`, {
+					FriendlyName: "Twin A2P trust",
+					Email: info.email,
+					PolicySid: SOLE_PROP_POLICY,
+				}),
+			)
+		: "";
+	if (!trustSid) return { steps, done: false, next: "Fix the failed step above and rerun." };
+	if (!(await cfgGet(env, "a2p_trust_submitted"))) {
+		const assign = await twilioForm(S, T, `${TRUSTHUB}/TrustProducts/${trustSid}/EntityAssignments`, {
+			ObjectSid: spEndUser,
+		});
+		if (!assign.ok && assign.status !== 409 && !/already/i.test(err(assign.data, assign.status))) {
+			steps.push({ step: "Attach brand identity", ok: false, note: err(assign.data, assign.status) });
+			return { steps, done: false, next: "Rerun to retry." };
+		}
+		const submit = await twilioForm(S, T, `${TRUSTHUB}/TrustProducts/${trustSid}`, { Status: "pending-review" });
+		if (!submit.ok && !/already|in-review|approved/i.test(err(submit.data, submit.status))) {
+			steps.push({ step: "Submit trust product", ok: false, note: err(submit.data, submit.status) });
+			return { steps, done: false, next: "Rerun to retry." };
+		}
+		await dbSet(env, "a2p_trust_submitted", "1");
+		steps.push({ step: "Submit trust product", ok: true, note: "submitted" });
+	} else steps.push({ step: "Submit trust product", ok: true, note: "already done" });
+
+	// 4. Brand registration — this is what texts the owner the OTP link.
+	const brandSid = await ensure("a2p_brand", "Brand registration", () =>
+		twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations`, {
+			CustomerProfileBundleSid: profileSid,
+			A2PProfileBundleSid: trustSid,
+			BrandType: "SOLE_PROPRIETOR",
+		}),
+	);
+	if (!brandSid) return { steps, done: false, next: "Fix the failed step above and rerun." };
+	const brand = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}`);
+	const brandStatus = String(brand.data.status ?? "UNKNOWN").toUpperCase();
+	steps.push({ step: "Brand status", ok: brandStatus === "APPROVED", note: brandStatus });
+
+	// 5. Messaging service holding both twin numbers. Per-number webhooks stay
+	// in charge of inbound (UseInboundWebhookOnNumber).
+	const msSid = await ensure("a2p_msgsvc", "Messaging service", () =>
+		twilioForm(S, T, `${MESSAGING}/Services`, {
+			FriendlyName: "Phone Twin",
+			UseInboundWebhookOnNumber: "true",
+		}),
+	);
+	if (msSid) {
+		const owned = await twilioApi(S, T, "/IncomingPhoneNumbers.json?PageSize=50");
+		const nums =
+			(owned.data as { incoming_phone_numbers?: Array<{ sid: string; phone_number: string }> }).incoming_phone_numbers ??
+			[];
+		const profiles = await loadProfiles(env);
+		const twinNums = new Set([cfg.twilioNumber, ...profiles.map((p) => p.number)].filter(Boolean) as string[]);
+		for (const n of nums.filter((x) => twinNums.has(x.phone_number))) {
+			const add = await twilioForm(S, T, `${MESSAGING}/Services/${msSid}/PhoneNumbers`, { PhoneNumberSid: n.sid });
+			const ok = add.ok || add.status === 409 || /already/i.test(err(add.data, add.status));
+			steps.push({ step: `Add ${n.phone_number}`, ok, note: ok ? "in service" : err(add.data, add.status) });
+		}
+	}
+
+	// 6. Campaign — only possible once the brand is approved (OTP link tapped).
+	if (brandStatus !== "APPROVED") {
+		return {
+			steps,
+			done: false,
+			next: `Twilio texted ${info.phone} a verification link — tap it, wait a few minutes, then rerun this. The campaign gets created automatically once the brand is approved.`,
+		};
+	}
+	const campaignDone = await cfgGet(env, "a2p_campaign");
+	if (!campaignDone) {
+		const campaign = await twilioForm(S, T, `${MESSAGING}/Services/${msSid}/Compliance/Usa2p`, {
+			BrandRegistrationSid: brandSid,
+			Description: "Personal AI phone assistant sending the account owner call summaries and notifications, and relaying personal messages the owner dictates to known contacts.",
+			MessageFlow:
+				"The account owner is the sole subscriber and opted in by configuring the assistant. Contacts receive only messages the owner explicitly dictates; replying STOP opts out.",
+			MessageSamples: [
+				"Twin digest: 2 calls today. Dennis wants a callback about Saturday.",
+				"It's Nick - I'll be there at 6.",
+			],
+			UsAppToPersonUsecase: "SOLE_PROPRIETOR",
+			HasEmbeddedLinks: "true",
+			HasEmbeddedPhone: "true",
+		});
+		if (!campaign.ok) {
+			steps.push({ step: "Campaign", ok: false, note: err(campaign.data, campaign.status) });
+			return { steps, done: false, next: "Campaign creation failed — send me the note above and I'll adjust." };
+		}
+		await dbSet(env, "a2p_campaign", String(campaign.data.sid ?? "created"));
+		steps.push({ step: "Campaign", ok: true, note: String(campaign.data.campaign_status ?? "submitted") });
+	} else steps.push({ step: "Campaign", ok: true, note: "already done" });
+	return {
+		steps,
+		done: true,
+		next: "Registration submitted. Carrier approval usually lands within hours to a couple of days — texts start delivering the moment it does. Re-run System Check tomorrow to confirm.",
+	};
+}
+
 // --- Twilio webhook signature validation (HMAC-SHA1 of URL + sorted params) ----
 
 async function signFor(url: string, params: URLSearchParams, authToken: string) {
@@ -1891,6 +2143,39 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 
 	return c.json({ findings, account: { type: acctType }, recentMessages: msgs.slice(0, 10), recentCalls: calls.slice(0, 10) });
 });
+
+// Run (or resume) the carrier text-delivery registration. Idempotent: done
+// steps are skipped, failures report Twilio's own message and can be rerun.
+twin.post(
+	"/a2p/register",
+	ownerOnly,
+	zValidator(
+		"json",
+		z.object({
+			firstName: z.string().min(1).max(50),
+			lastName: z.string().min(1).max(50),
+			email: z.string().email(),
+			phone: z.string().min(10).max(20),
+			street: z.string().min(3).max(100),
+			city: z.string().min(2).max(50),
+			region: z.string().min(2).max(30),
+			postalCode: z.string().min(5).max(10),
+		}),
+	),
+	async (c) => {
+		const cfg = await loadCfg(c.env);
+		if (!cfg.twilioSid || !cfg.twilioToken) return c.json({ error: "twilio_not_connected" }, 400);
+		const info = c.req.valid("json");
+		const phone = e164(info.phone);
+		if (!phone) return c.json({ error: "bad_phone", message: "Use a 10-digit US number." }, 400);
+		const result = await a2pRegister(c.env, cfg, { ...info, phone }).catch((e) => ({
+			steps: [{ step: "Registration", ok: false, note: e instanceof Error ? e.message : "unknown error" }],
+			done: false,
+			next: "Send me the error above.",
+		}));
+		return c.json(result);
+	},
+);
 
 // Public, idempotent digest trigger (like /wire): sends at most one digest per
 // local day, only after the digest hour, and reveals nothing. Point any
