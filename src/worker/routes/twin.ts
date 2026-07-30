@@ -1094,7 +1094,42 @@ async function a2pRegister(
 	if (!brandSid) return { steps, done: false, next: "Fix the failed step above and rerun." };
 	const brand = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}`);
 	const brandStatus = String(brand.data.status ?? "UNKNOWN").toUpperCase();
-	steps.push({ step: "Brand status", ok: brandStatus === "APPROVED", note: brandStatus });
+	const failureReason = String(brand.data.failure_reason ?? "");
+	steps.push({
+		step: "Brand status",
+		ok: brandStatus === "APPROVED",
+		note: brandStatus + (failureReason ? ` — ${failureReason}` : ""),
+	});
+	// FAILED brands (usually an expired verification link) get refiled for a
+	// fresh OTP text — capped at two refiles since each may bill a small fee.
+	if (brandStatus === "FAILED") {
+		const attempts = Number((await cfgGet(env, "a2p_brand_attempts")) || 0);
+		if (attempts >= 2) {
+			return {
+				steps,
+				done: false,
+				next: `Brand failed ${attempts + 1} times${failureReason ? ` (${failureReason})` : ""} — screenshot this to Claude before refiling again.`,
+			};
+		}
+		const fresh = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations`, {
+			CustomerProfileBundleSid: profileSid,
+			A2PProfileBundleSid: trustSid,
+			BrandType: "SOLE_PROPRIETOR",
+		});
+		const freshSid = String(fresh.data.sid ?? "");
+		if (!fresh.ok || !freshSid) {
+			steps.push({ step: "Refile brand", ok: false, note: err(fresh.data, fresh.status) });
+			return { steps, done: false, next: "Refile failed — screenshot this to Claude." };
+		}
+		await dbSet(env, "a2p_brand", freshSid);
+		await dbSet(env, "a2p_brand_attempts", String(attempts + 1));
+		steps.push({ step: "Refile brand", ok: true, note: freshSid });
+		return {
+			steps,
+			done: false,
+			next: "Brand refiled — a FRESH verification text is heading to your cell. Tap the link as soon as it arrives (they expire), then rerun this.",
+		};
+	}
 
 	// 5. Messaging service holding both twin numbers. Per-number webhooks stay
 	// in charge of inbound (UseInboundWebhookOnNumber).
@@ -2145,7 +2180,10 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 				if (st === "APPROVED") {
 					findings.push("✓ Carrier registration: brand approved — the campaign files itself within minutes (this check just nudged it).");
 				} else if (st === "FAILED") {
-					findings.push("✗ Carrier registration: brand FAILED — screenshot this to Claude to get it fixed.");
+					const reason = String((brand.data as { failure_reason?: string }).failure_reason ?? "");
+					findings.push(
+						`✗ Carrier registration: brand FAILED${reason ? ` — ${reason}` : ""}. Tap "Register / resume" on the registration card: it refiles the brand and Twilio texts you a fresh verification link — tap that link quickly, they expire.`,
+					);
 				} else {
 					findings.push(
 						`• Carrier registration: brand is ${st}. If Twilio texted you a verification link, tap it — the flow resumes on its own afterward.`,
