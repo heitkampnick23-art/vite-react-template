@@ -55,6 +55,19 @@ export function Remote() {
 	});
 	const digest = useMutation({ mutationFn: api.twinDigestNow });
 	const syscheck = useMutation({ mutationFn: api.twinSysCheck });
+	const [a2p, setA2p] = useState({
+		firstName: "Nick",
+		lastName: "",
+		email: "heitkampnick23@gmail.com",
+		phone: "9525641126",
+		street: "",
+		city: "",
+		region: "MN",
+		postalCode: "",
+	});
+	const a2pReady =
+		a2p.firstName.trim() && a2p.lastName.trim() && a2p.email.trim() && a2p.phone.trim() && a2p.street.trim() && a2p.city.trim() && a2p.region.trim() && a2p.postalCode.trim();
+	const registerA2p = useMutation({ mutationFn: () => api.twinA2pRegister(a2p) });
 
 	if (status.isLoading) {
 		return <div className="grid min-h-[50vh] place-items-center text-sm text-zinc-500">Loading…</div>;
@@ -239,6 +252,43 @@ export function Remote() {
 								))}
 							</details>
 						)}
+					</div>
+				)}
+			</Card>
+
+			{/* A2P text-delivery registration */}
+			<Card className="mb-3">
+				<div className="flex items-center gap-2 text-sm font-semibold">
+					<MessageSquare className="h-4 w-4" /> Fix text delivery (carrier registration)
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					US carriers delete texts from unregistered numbers (that's your error 30034). Fill this in once and tap
+					Register — your server runs the whole registration with Twilio. Mid-way, Twilio texts your cell a
+					verification link: tap it, then tap Register again to finish. Costs ~$4 once + ~$2/mo, billed to your
+					Twilio balance.
+				</p>
+				<div className="mt-3 grid grid-cols-2 gap-2">
+					<input className={inputCls} placeholder="First name" value={a2p.firstName} onChange={(e) => setA2p({ ...a2p, firstName: e.target.value })} />
+					<input className={inputCls} placeholder="Last name" value={a2p.lastName} onChange={(e) => setA2p({ ...a2p, lastName: e.target.value })} />
+					<input className={inputCls + " col-span-2"} placeholder="Email" value={a2p.email} onChange={(e) => setA2p({ ...a2p, email: e.target.value })} />
+					<input className={inputCls} placeholder="Cell (for the OTP text)" value={a2p.phone} onChange={(e) => setA2p({ ...a2p, phone: e.target.value })} />
+					<input className={inputCls} placeholder="ZIP" value={a2p.postalCode} onChange={(e) => setA2p({ ...a2p, postalCode: e.target.value })} />
+					<input className={inputCls + " col-span-2"} placeholder="Street address" value={a2p.street} onChange={(e) => setA2p({ ...a2p, street: e.target.value })} />
+					<input className={inputCls} placeholder="City" value={a2p.city} onChange={(e) => setA2p({ ...a2p, city: e.target.value })} />
+					<input className={inputCls} placeholder="State (e.g. MN)" value={a2p.region} onChange={(e) => setA2p({ ...a2p, region: e.target.value })} />
+				</div>
+				<Button size="sm" className="mt-2" disabled={!a2pReady || registerA2p.isPending} onClick={() => registerA2p.mutate()}>
+					{registerA2p.isPending ? "Registering…" : registerA2p.data ? "Register / resume" : "Register"}
+				</Button>
+				{registerA2p.isError && <div className="mt-1 text-xs text-red-400">{errMsg(registerA2p.error)}</div>}
+				{registerA2p.data && (
+					<div className="mt-2 space-y-1">
+						{registerA2p.data.steps.map((s, i) => (
+							<div key={i} className={"rounded px-2 py-1 text-xs " + (s.ok ? "bg-emerald-500/10 text-emerald-300" : "bg-red-500/10 text-red-300")}>
+								{s.ok ? "✓" : "✗"} {s.step}: {s.note}
+							</div>
+						))}
+						<div className="rounded bg-white/5 px-2 py-1.5 text-xs text-zinc-300">{registerA2p.data.next}</div>
 					</div>
 				)}
 			</Card>
