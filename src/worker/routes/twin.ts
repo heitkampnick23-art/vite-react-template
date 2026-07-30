@@ -1093,7 +1093,7 @@ async function a2pRegister(
 	);
 	if (!brandSid) return { steps, done: false, next: "Fix the failed step above and rerun." };
 	const brand = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}`);
-	let brandStatus = String(brand.data.status ?? "UNKNOWN").toUpperCase();
+	const brandStatus = String(brand.data.status ?? "UNKNOWN").toUpperCase();
 	const failureReason = String(brand.data.failure_reason ?? "");
 	steps.push({
 		step: "Brand status",
