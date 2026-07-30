@@ -2098,6 +2098,34 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 		);
 	}
 
+	// Carrier (A2P) registration progress — and running the check itself
+	// nudges the self-driving flow forward.
+	if (await cfgGet(c.env, "a2p_info")) {
+		c.executionCtx.waitUntil(a2pAutoResume(c.env).then(() => undefined, () => {}));
+		if (await cfgGet(c.env, "a2p_campaign")) {
+			findings.push(
+				"✓ Carrier registration: campaign filed — waiting on carrier approval (hours to ~2 days). Texts start delivering the moment it lands, and your twin will text you the ✅ proof.",
+			);
+		} else {
+			const brandSid = await cfgGet(c.env, "a2p_brand");
+			if (brandSid) {
+				const brand = await twilioForm(cfg.twilioSid, cfg.twilioToken, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}`);
+				const st = String((brand.data as { status?: string }).status ?? "UNKNOWN").toUpperCase();
+				if (st === "APPROVED") {
+					findings.push("✓ Carrier registration: brand approved — the campaign files itself within minutes (this check just nudged it).");
+				} else if (st === "FAILED") {
+					findings.push("✗ Carrier registration: brand FAILED — screenshot this to Claude to get it fixed.");
+				} else {
+					findings.push(
+						`• Carrier registration: brand is ${st}. If Twilio texted you a verification link, tap it — the flow resumes on its own afterward.`,
+					);
+				}
+			} else {
+				findings.push("• Carrier registration: profile steps in progress — this check just nudged them along. Re-run in a few minutes.");
+			}
+		}
+	}
+
 	// Numbers + webhook repair
 	const twinNumbers = new Map<string, string>(); // number -> twin name
 	if (cfg.twilioNumber) twinNumbers.set(cfg.twilioNumber, cfg.twinName);
@@ -2283,6 +2311,8 @@ twin.get("/calls", ownerOnly, async (c) => {
 });
 
 twin.get("/status", ownerOnly, async (c) => {
+	// Opening the app counts as a nudge for the self-driving registration.
+	c.executionCtx.waitUntil(a2pAutoResume(c.env).then(() => undefined, () => {}));
 	await twinAutoFinish(c.env).catch(() => {});
 	const cfg = await loadCfg(c.env);
 	return c.json({
