@@ -2087,6 +2087,35 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 			: `✓ Twilio account is ${acctType} (${(acct.data as { status?: string }).status ?? "?"}).`,
 	);
 	findings.push(cell ? `✓ Your cell on file: ${cell}.` : "✗ TWIN_NOTIFY_CELL isn't set — transfers and notifications have nowhere to go.");
+
+	// Which carrier is the owner's cell on? Forwarding dial codes are
+	// carrier-family-specific — GSM codes (**61*) silently do nothing on
+	// Verizon and vice versa, which reads as "forwarding just doesn't work".
+	if (cell && cfg.twilioNumber) {
+		const lookup = await twilioForm(
+			cfg.twilioSid,
+			cfg.twilioToken,
+			`https://lookups.twilio.com/v2/PhoneNumbers/${encodeURIComponent(cell)}?Fields=line_type_intelligence`,
+		);
+		const carrier = String(
+			(lookup.data as { line_type_intelligence?: { carrier_name?: string } }).line_type_intelligence?.carrier_name ?? "",
+		);
+		const digits = cfg.twilioNumber.replace(/\D/g, "");
+		const ten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+		if (/verizon|cellco|visible|straight talk|tracfone/i.test(carrier)) {
+			findings.push(
+				`✗ IMPORTANT: your cell is on ${carrier} — a Verizon-family network. The **61*/##004# codes DO NOTHING there (that's why calls still hit voicemail). Dial exactly: *71${ten} to forward missed calls to the twin, and *73 to turn it off.`,
+			);
+		} else if (/t-mobile|tmobile|metro|sprint|mint|at&t|att|cingular|cricket/i.test(carrier)) {
+			findings.push(
+				`✓ Your cell is on ${carrier} (GSM family) — the right code is **61*${digits}# (off: ##004#). Dial it and watch for a "forwarding enabled" confirmation banner; an error banner means the carrier blocks it and their support has the variant.`,
+			);
+		} else if (carrier) {
+			findings.push(
+				`• Your cell is on ${carrier} — couldn't classify it. Try *71${ten} (Verizon-style) first, then **61*${digits}# (GSM-style); whichever shows a confirmation banner is the one.`,
+			);
+		}
+	}
 	findings.push(c.env.ANTHROPIC_API_KEY ? "✓ Claude brain connected." : "✗ ANTHROPIC_API_KEY missing — twins can't think.");
 
 	// Did Twilio reach us but get rejected? That looks exactly like "nothing
