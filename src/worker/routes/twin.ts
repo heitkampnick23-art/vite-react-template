@@ -1006,10 +1006,12 @@ async function a2pRegister(
 	);
 	const docSid = endUserSid
 		? await ensure("a2p_doc", "Address document", () =>
+				// Twilio's TrustHub API expects address_sids as a single SID string
+				// (despite the plural name) — an array gets "Unable to process JSON".
 				twilioForm(S, T, `${TRUSTHUB}/SupportingDocuments`, {
 					FriendlyName: "Twin owner address",
 					Type: "customer_profile_address",
-					Attributes: JSON.stringify({ address_sids: [addressSid] }),
+					Attributes: JSON.stringify({ address_sids: addressSid }),
 				}),
 			)
 		: "";
