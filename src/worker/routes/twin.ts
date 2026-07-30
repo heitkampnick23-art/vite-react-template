@@ -1153,6 +1153,48 @@ async function a2pRegister(
 	};
 }
 
+// Self-driving wrapper around a2pRegister: once owner info is stored
+// (a2p_info), every webhook/wire pass nudges the registration forward with a
+// 10-minute cooldown — so after the owner taps Twilio's OTP link, the next
+// call or text to any twin resumes the flow and files the campaign, no button
+// pressing. When done, the twin texts the owner a completion message whose
+// arrival itself proves delivery works (it can only land once carriers
+// approve); it retries that notification a few times across days.
+async function a2pAutoResume(env: Env): Promise<string> {
+	const infoRaw = await cfgGet(env, "a2p_info");
+	if (!infoRaw) return "no info stored";
+	const cfg = await loadCfg(env);
+	if (!cfg.twilioSid || !cfg.twilioToken) return "twilio not connected";
+	if (await cfgGet(env, "a2p_done")) {
+		const sent = Number((await cfgGet(env, "a2p_done_notified")) || 0);
+		const last = Number((await cfgGet(env, "a2p_notify_last")) || 0);
+		if (sent < 4 && Date.now() - last > 6 * 3600 * 1000 && env.TWIN_NOTIFY_CELL && cfg.twilioNumber) {
+			await twilioApi(cfg.twilioSid, cfg.twilioToken, "/Messages.json", {
+				To: env.TWIN_NOTIFY_CELL,
+				From: cfg.twilioNumber,
+				Body: "✅ Text delivery registration is complete — and this message arriving is the proof. Your twins can text now.",
+			});
+			await dbSet(env, "a2p_done_notified", String(sent + 1));
+			await dbSet(env, "a2p_notify_last", String(Date.now()));
+			return "sent completion notice";
+		}
+		return "done";
+	}
+	const lastTry = Number((await cfgGet(env, "a2p_last_try")) || 0);
+	if (Date.now() - lastTry < 600_000) return "cooldown";
+	await dbSet(env, "a2p_last_try", String(Date.now()));
+	let info: Parameters<typeof a2pRegister>[2];
+	try {
+		info = JSON.parse(infoRaw) as Parameters<typeof a2pRegister>[2];
+	} catch {
+		return "bad stored info";
+	}
+	const result = await a2pRegister(env, cfg, info).catch(() => null);
+	if (!result) return "error — will retry";
+	if (result.done) await dbSet(env, "a2p_done", "1");
+	return result.done ? "completed" : `in progress: ${result.next}`;
+}
+
 // --- Twilio webhook signature validation (HMAC-SHA1 of URL + sorted params) ----
 
 async function signFor(url: string, params: URLSearchParams, authToken: string) {
@@ -1487,6 +1529,7 @@ twin.post("/voice/incoming", async (c) => {
 		c.executionCtx.waitUntil(refreshCallerSummary(c.env, from).catch(() => {}));
 	}
 	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
+	c.executionCtx.waitUntil(a2pAutoResume(c.env).then(() => undefined, () => {}));
 	const audio = await speak(c.env, cfg, greeting);
 	return xml(gather(c.env, audio, greeting));
 });
@@ -1754,6 +1797,7 @@ twin.post("/voice/answer", async (c) => {
 twin.get("/wire", async (c) => {
 	const note = await twinAutoFinish(c.env).catch((e) => `error: ${e instanceof Error ? e.message : "unknown"}`);
 	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
+	c.executionCtx.waitUntil(a2pAutoResume(c.env).then(() => undefined, () => {}));
 	const cfg = await loadCfg(c.env);
 	let numbers: Array<{ phoneNumber: string; voiceUrl: string }> = [];
 	let accountType = "";
@@ -1853,7 +1897,36 @@ twin.post("/sms/incoming", async (c) => {
 		const addCmd = body.match(/^(?:add|save)(?:\s+contact)?\s+(.{1,40}?)\s+(\+?[\d\s().-]{10,16})$/i);
 		const rememberCmd = body.match(/^remember[:,]?\s+([\s\S]{3,})$/i);
 		const buyCmd = body.match(/^buy\s+(?:a\s+|me\s+)?(\d{3})\s*(?:number)?$/i);
-		if (buyCmd) {
+		// One-text carrier registration: "register First Last, Street, City, ST 55322".
+		// Stores the info and kicks the self-driving A2P flow; from here every
+		// webhook nudges it forward and the twin texts back once delivery works.
+		const regCmd = body.match(/^register\s+([\s\S]+)$/i);
+		if (regCmd) {
+			const parts = regCmd[1].split(",").map((s) => s.trim());
+			const name = (parts[0] ?? "").split(/\s+/);
+			const stateZip = (parts[3] ?? "").match(/^([A-Za-z]{2})[\s,]+(\d{5})(?:-\d{4})?$/);
+			if (parts.length >= 4 && name.length >= 2 && parts[1] && parts[2] && stateZip) {
+				await dbSet(
+					c.env,
+					"a2p_info",
+					JSON.stringify({
+						firstName: name[0],
+						lastName: name.slice(1).join(" "),
+						email: c.env.OWNER_EMAIL || "heitkampnick23@gmail.com",
+						phone: c.env.TWIN_NOTIFY_CELL || from,
+						street: parts[1],
+						city: parts[2],
+						region: stateZip[1].toUpperCase(),
+						postalCode: stateZip[2],
+					}),
+				);
+				await dbSet(c.env, "a2p_last_try", "0"); // run immediately
+				c.executionCtx.waitUntil(a2pAutoResume(c.env).then(() => undefined, () => {}));
+				await send(from, "Got it — filing your carrier registration now. Tap the link Twilio texts you; I'll text you when everything's done.");
+			} else {
+				await send(from, 'Format: "register First Last, Street, City, ST 55322"');
+			}
+		} else if (buyCmd) {
 			const res = await buyExtraNumber(c.env, cfg, [buyCmd[1]]);
 			await send(
 				from,
@@ -1886,6 +1959,7 @@ twin.post("/sms/incoming", async (c) => {
 		await send(c.env.TWIN_NOTIFY_CELL, `Text to your twin from ${known ? `${known.name} (${from})` : from}: ${body.slice(0, 500)}`);
 	}
 	c.executionCtx.waitUntil(twinNightlyDigest(c.env).then(() => undefined, () => {}));
+	c.executionCtx.waitUntil(a2pAutoResume(c.env).then(() => undefined, () => {}));
 	return c.body("<Response></Response>", 200, { "content-type": "text/xml" });
 });
 
@@ -2168,11 +2242,13 @@ twin.post(
 		const info = c.req.valid("json");
 		const phone = e164(info.phone);
 		if (!phone) return c.json({ error: "bad_phone", message: "Use a 10-digit US number." }, 400);
+		await dbSet(c.env, "a2p_info", JSON.stringify({ ...info, phone }));
 		const result = await a2pRegister(c.env, cfg, { ...info, phone }).catch((e) => ({
 			steps: [{ step: "Registration", ok: false, note: e instanceof Error ? e.message : "unknown error" }],
 			done: false,
 			next: "Send me the error above.",
 		}));
+		if (result.done) await dbSet(c.env, "a2p_done", "1");
 		return c.json(result);
 	},
 );
