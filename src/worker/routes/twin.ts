@@ -1124,10 +1124,17 @@ async function a2pRegister(
 		await dbSet(env, "a2p_brand", freshSid);
 		await dbSet(env, "a2p_brand_attempts", String(attempts + 1));
 		steps.push({ step: "Refile brand", ok: true, note: freshSid });
+		// Creating a brand does NOT send the verification text by itself — that
+		// omission is why the owner never received one. Fire it explicitly.
+		const otp = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${freshSid}/SmsOtp`, {});
+		steps.push({ step: "Verification text", ok: otp.ok, note: otp.ok ? "sent now" : err(otp.data, otp.status) });
+		if (otp.ok) await dbSet(env, "a2p_otp_last", String(Date.now()));
 		return {
 			steps,
 			done: false,
-			next: "Brand refiled — a FRESH verification text is heading to your cell. Tap the link as soon as it arrives (they expire), then rerun this.",
+			next: otp.ok
+				? "Brand refiled and the verification text was JUST sent to your cell — tap the link the moment it arrives (they expire), then rerun this."
+				: "Brand refiled but the verification text failed to send — rerun this in a minute to retry it.",
 		};
 	}
 
