@@ -1155,10 +1155,24 @@ async function a2pRegister(
 
 	// 6. Campaign — only possible once the brand is approved (OTP link tapped).
 	if (brandStatus !== "APPROVED") {
+		// Fire a fresh verification text on demand (30-min throttle) — iPhones
+		// often filter the first one into Unknown Senders and the links expire.
+		const lastOtp = Number((await cfgGet(env, "a2p_otp_last")) || 0);
+		let otpNote = "";
+		if (Date.now() - lastOtp > 30 * 60 * 1000) {
+			const otp = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}/SmsOtp`, {});
+			if (otp.ok) {
+				await dbSet(env, "a2p_otp_last", String(Date.now()));
+				otpNote = " A fresh verification text was just sent";
+				steps.push({ step: "Verification text", ok: true, note: "re-sent just now" });
+			}
+		} else {
+			otpNote = " A verification text was sent within the last half hour";
+		}
 		return {
 			steps,
 			done: false,
-			next: `Twilio texted ${info.phone} a verification link — tap it, wait a few minutes, then rerun this. The campaign gets created automatically once the brand is approved.`,
+			next: `Waiting on your tap:${otpNote} to ${info.phone} — check Messages, INCLUDING the Unknown Senders/junk filter, and tap the link right away. Then rerun this; the campaign files automatically once the brand approves.`,
 		};
 	}
 	const campaignDone = await cfgGet(env, "a2p_campaign");
