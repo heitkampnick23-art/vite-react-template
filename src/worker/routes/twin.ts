@@ -1571,10 +1571,20 @@ twin.post("/voice/incoming", async (c) => {
 		[cfg.twilioNumber, ...(await loadProfiles(c.env)).map((p) => p.number)].filter(Boolean) as string[],
 	);
 	if (from && ownNumbers.has(from)) return xml("<Reject/>");
+	// A ForwardedFrom matching the owner's cell proves the carrier forwarding
+	// code is live — record it so System Check can verify instead of guessing,
+	// and greet as the answering service the caller actually reached.
+	const fwd = params.get("ForwardedFrom") ?? "";
+	const missedOwner =
+		!!fwd &&
+		!!c.env.TWIN_NOTIFY_CELL &&
+		fwd.replace(/\D/g, "").endsWith(c.env.TWIN_NOTIFY_CELL.replace(/\D/g, "").slice(-10));
+	if (missedOwner) c.executionCtx.waitUntil(dbSet(c.env, "last_forwarded_at", String(Date.now())).catch(() => {}));
 	// Repeat callers get greeted like the twin remembers them — because it does.
 	const mem = await getCaller(c.env, from).catch(() => null);
-	const greeting =
-		mem && mem.call_count > 0
+	const greeting = missedOwner
+		? `Hey${mem?.name ? ` ${mem.name}` : ""}, ${cfg.twinName} can't grab the phone right now — you've got his AI twin. What's up?`
+		: mem && mem.call_count > 0
 			? `Hey${mem.name ? ` ${mem.name}` : ""}, it's ${cfg.twinName}'s AI twin again — good to hear from you. What's up?`
 			: `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
 	const callSid = params.get("CallSid") ?? "unknown";
@@ -1673,7 +1683,9 @@ twin.post("/voice/respond", async (c) => {
 	// their cell (caller sees the twin's number so they know it's a transfer).
 	if (
 		c.env.TWIN_NOTIFY_CELL &&
-		/(real (nick|person|human)|speak to nick|talk to nick|transfer me|urgent|emergency|actual (person|human)|right away)/i.test(heard)
+		/(real (nick|person|human|one|him)|speak (to|with) (nick|him)|talk (to|with) (nick|him)|is nick (there|around|available|in)|put (him|nick) on|get (him|nick)( on| for me)?\b|where('| i)s nick|reach (him|nick)|transfer|connect me|a (human|person|real person)|urgent|emergency|right away)/i.test(
+			heard,
+		)
 	) {
 		const msg = "You got it — connecting you to the real Nick right now. Hang tight.";
 		history.push({ role: "assistant", content: `${msg} [transferring call]` });
@@ -2160,9 +2172,21 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 		);
 		const digits = cfg.twilioNumber.replace(/\D/g, "");
 		const ten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+		// The definitive forwarding test: has a call forwarded from the owner's
+		// cell ever actually reached the twin?
+		const lastFwd = Number((await cfgGet(c.env, "last_forwarded_at")) || 0);
+		if (lastFwd) {
+			findings.push(
+				`✓ Missed-call forwarding VERIFIED working — a call forwarded from your cell reached the twin at ${new Date(lastFwd).toLocaleString()}.`,
+			);
+		} else {
+			findings.push(
+				`✗ FORWARDING NOT ACTIVE: no call forwarded from your cell has EVER reached the twin — that's why missed calls still hit voicemail. Dial the code below, then test by calling your cell from another phone and letting it ring out; rerun this and this line flips green.`,
+			);
+		}
 		if (/verizon|cellco|visible|straight talk|tracfone/i.test(carrier)) {
 			findings.push(
-				`✗ IMPORTANT: your cell is on ${carrier} — a Verizon-family network. The **61*/##004# codes DO NOTHING there (that's why calls still hit voicemail). Dial exactly: *71${ten} to forward missed calls to the twin, and *73 to turn it off.`,
+				`${lastFwd ? "•" : "✗"} Your cell is on ${carrier} — a Verizon-family network. The **61*/##004# codes DO NOTHING there. Dial exactly: *71${ten} to forward missed calls to the twin, and *73 to turn it off.`,
 			);
 		} else if (/t-mobile|tmobile|metro|sprint|mint|at&t|att|cingular|cricket/i.test(carrier)) {
 			findings.push(

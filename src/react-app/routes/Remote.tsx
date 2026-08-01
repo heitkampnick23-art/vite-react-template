@@ -10,7 +10,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
-import { Brain, MessageSquare, Moon, Phone, PhoneForwarded, Settings, Stethoscope, UserPlus } from "lucide-react";
+import { Brain, MessageSquare, Moon, Phone, PhoneForwarded, PhoneOutgoing, Settings, Stethoscope, UserPlus } from "lucide-react";
 
 function errMsg(e: unknown) {
 	if (e instanceof Error) {
@@ -38,6 +38,16 @@ export function Remote() {
 		retry: false,
 	});
 
+	const contactsList = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
+	const [callTo, setCallTo] = useState("");
+	const [callAs, setCallAs] = useState("");
+	const placeCall = useMutation({
+		mutationFn: () => {
+			const digits = callTo.replace(/\D/g, "");
+			const to = digits.length === 10 ? `+1${digits}` : `+${digits}`;
+			return api.twinCall(to, callAs || undefined);
+		},
+	});
 	const [fact, setFact] = useState("");
 	const addFact = useMutation({
 		mutationFn: () => api.twinAddFact(fact.trim()),
@@ -106,6 +116,59 @@ export function Remote() {
 					</div>
 				</Card>
 			))}
+
+			{/* Have a twin place a call */}
+			<Card className="mb-3">
+				<div className="flex items-center gap-2 text-sm font-semibold">
+					<PhoneOutgoing className="h-4 w-4" /> Have a twin call someone
+				</div>
+				<p className="mt-1 text-xs text-zinc-500">
+					Pick a contact or type a number — the twin dials them and handles the conversation. It always introduces
+					itself as your AI; only call people who expect it.
+				</p>
+				{(contactsList.data?.contacts.length ?? 0) > 0 && (
+					<select
+						className={inputCls + " mt-2"}
+						value=""
+						onChange={(e) => e.target.value && setCallTo(e.target.value)}
+					>
+						<option value="">Pick a contact…</option>
+						{contactsList.data!.contacts.map((k) => (
+							<option key={k.id} value={k.phone}>
+								{k.name} ({k.phone})
+							</option>
+						))}
+					</select>
+				)}
+				<div className="mt-2 flex gap-2">
+					<input
+						className={inputCls}
+						placeholder="9525551234"
+						inputMode="tel"
+						value={callTo}
+						onChange={(e) => setCallTo(e.target.value)}
+					/>
+					{(profiles.data?.profiles.filter((p) => p.number).length ?? 0) > 0 && (
+						<select className={inputCls + " max-w-36"} value={callAs} onChange={(e) => setCallAs(e.target.value)}>
+							<option value="">As: {s.twinName}</option>
+							{profiles.data!.profiles.filter((p) => p.number).map((p) => (
+								<option key={p.id} value={p.id}>
+									As: {p.name}
+								</option>
+							))}
+						</select>
+					)}
+					<Button
+						size="sm"
+						disabled={callTo.replace(/\D/g, "").length < 10 || placeCall.isPending}
+						onClick={() => placeCall.mutate()}
+					>
+						{placeCall.isPending ? "Dialing…" : "Call"}
+					</Button>
+				</div>
+				{placeCall.isSuccess && <div className="mt-1 text-xs text-emerald-400">Dialing {placeCall.data.to} now.</div>}
+				{placeCall.isError && <div className="mt-1 text-xs text-red-400">{errMsg(placeCall.error)}</div>}
+			</Card>
 
 			{/* Forwarding */}
 			{forwarding.data && (
