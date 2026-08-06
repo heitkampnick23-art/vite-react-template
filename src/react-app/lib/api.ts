@@ -95,6 +95,7 @@ export const api = {
 		req<{ ok: true; number: string }>("/api/twin/numbers/buy", { method: "POST", body: JSON.stringify({ area }) }),
 	twinDigestNow: () => req<{ ok: boolean; note: string }>("/api/twin/digest/send", { method: "POST" }),
 	twinSysCheck: () => req<TwinSysCheck>("/api/twin/syscheck"),
+	twinVoiceStatus: () => req<TwinVoiceStatus>("/api/twin/voicestatus"),
 	twinA2pRegister: (body: {
 		firstName: string;
 		lastName: string;
@@ -133,6 +134,14 @@ export type TwinProfile = {
 };
 export type TwinLibraryVoice = { publicOwnerId: string; voiceId: string; name: string; category: string; description: string };
 export type TwinA2pResult = { steps: Array<{ step: string; ok: boolean; note: string }>; done: boolean; next: string };
+export type TwinVoiceStatus = {
+	state: "ok" | "no_key" | "key_blocked";
+	detail?: string;
+	twins: Array<{ name: string; voiceName: string; isClone: boolean; works: boolean; repaired: boolean }>;
+	hasClone?: boolean;
+	cloneNames?: string[];
+	action: string;
+};
 export type TwinSysCheck = {
 	findings: string[];
 	account?: { type: string };
