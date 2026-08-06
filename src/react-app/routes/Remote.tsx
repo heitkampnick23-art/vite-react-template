@@ -144,7 +144,7 @@ export function Remote() {
 				)}
 				<textarea
 					className={inputCls + " mt-2 min-h-16"}
-					placeholder='What should it say or find out? e.g. "Ask if my part came in" or "Tell him I\'m running 20 min late"'
+					placeholder={'What should it say or find out? e.g. "Ask if my part came in" or "Tell him I am running late"'}
 					value={callMission}
 					onChange={(e) => setCallMission(e.target.value)}
 				/>
