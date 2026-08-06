@@ -2200,6 +2200,61 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 	}
 	findings.push(c.env.ANTHROPIC_API_KEY ? "✓ Claude brain connected." : "✗ ANTHROPIC_API_KEY missing — twins can't think.");
 
+	// ElevenLabs voice pipeline — report the provider's actual words, plus a
+	// live TTS test per twin, so "the clone voice stopped working" gets a
+	// concrete reason instead of a mystery.
+	const explainEleven = (status: number, body: string): string => {
+		if (/unusual.?activity|free.?tier.*(disabled|abuse)/i.test(body))
+			return " → ElevenLabs disables FREE-tier API keys used from cloud servers. Fix: upgrade ElevenLabs to Starter (~$5/mo) at elevenlabs.io, or paste a key from a paid account in Twin Setup.";
+		if (/quota|character.*limit|exceeds/i.test(body)) return " → your ElevenLabs monthly character quota is used up — upgrade the plan or wait for the reset.";
+		if (status === 401) return " → the key is invalid or revoked — paste a fresh key in Twin Setup.";
+		if (/voice.*not.*found|does not exist/i.test(body)) return " → that voice is no longer on your ElevenLabs account — pick a new one in Twin Setup.";
+		return "";
+	};
+	if (!cfg.elevenKey) {
+		findings.push("✗ No ElevenLabs key on file — twins speak with the standard fallback voice.");
+	} else {
+		const vr = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
+		if (!vr.ok) {
+			const body = (await vr.text()).slice(0, 250);
+			findings.push(`✗ VOICES DOWN: ElevenLabs rejected the API key (HTTP ${vr.status}): ${body}${explainEleven(vr.status, body)} Calls still work — twins use the standard voice until this is fixed.`);
+		} else {
+			const vd = (await vr.json()) as { voices?: Array<{ voice_id: string; name: string }> };
+			const accountVoices = vd.voices ?? [];
+			findings.push(`✓ ElevenLabs key OK — ${accountVoices.length} voices on the account.`);
+			const voiceTargets = [
+				{ name: cfg.twinName, voice: cfg.elevenVoice, speed: cfg.voiceSpeed },
+				...profiles
+					.filter((p) => p.voice_id)
+					.map((p) => ({ name: p.name, voice: p.voice_id!, speed: p.voice_speed ?? cfg.voiceSpeed })),
+			];
+			for (const t of voiceTargets) {
+				if (!t.voice) {
+					findings.push(`✗ ${t.name}: no voice selected — using the standard fallback voice.`);
+					continue;
+				}
+				const named = accountVoices.find((v) => v.voice_id === t.voice);
+				const tr = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${t.voice}?output_format=mp3_22050_32`, {
+					method: "POST",
+					headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+					body: JSON.stringify({
+						text: "test",
+						model_id: c.env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
+						voice_settings: { stability: 0.5, similarity_boost: 0.85, speed: t.speed },
+					}),
+				});
+				if (tr.ok) {
+					findings.push(`✓ ${t.name}'s voice (${named?.name ?? t.voice}) synthesizes fine.`);
+				} else {
+					const body = (await tr.text()).slice(0, 250);
+					findings.push(
+						`✗ ${t.name}'s voice FAILS (HTTP ${tr.status}): ${body}${explainEleven(tr.status, body)}${named ? "" : " Note: this voice isn't on your ElevenLabs account anymore."}`,
+					);
+				}
+			}
+		}
+	}
+
 	// Did Twilio reach us but get rejected? That looks exactly like "nothing
 	// happens" from the outside.
 	const sigFail = await c.env.CACHE.get<{ at: number; expected: string; actual: string }>("twin:sigfail", "json");
@@ -2613,7 +2668,12 @@ twin.get("/voices", ownerOnly, async (c) => {
 	const cfg = await loadCfg(c.env);
 	if (!cfg.elevenKey) return c.json({ error: "elevenlabs_not_connected" }, 400);
 	const res = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
-	if (!res.ok) return c.json({ error: "elevenlabs_error" }, 502);
+	if (!res.ok) {
+		return c.json(
+			{ error: "elevenlabs_error", message: `ElevenLabs said (HTTP ${res.status}): ${(await res.text()).slice(0, 250)}` },
+			502,
+		);
+	}
 	const data = (await res.json()) as { voices?: Array<{ voice_id: string; name: string; category?: string }> };
 	return c.json({ voices: (data.voices ?? []).map((v) => ({ id: v.voice_id, name: v.name, category: v.category ?? "" })) });
 });
