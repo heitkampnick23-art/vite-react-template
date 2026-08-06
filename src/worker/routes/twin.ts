@@ -2144,6 +2144,106 @@ twin.get("/forwarding", ownerOnly, async (c) => {
 	});
 });
 
+// Live voice health with self-healing, loaded automatically by the app. If
+// the owner's clone exists and synthesizes, the main twin is re-pointed at it
+// on the spot; a profile whose voice broke gets re-resolved from its seed's
+// voiceQuery. Whatever can't be fixed in software gets a one-line action.
+twin.get("/voicestatus", ownerOnly, async (c) => {
+	const cfg = await loadCfg(c.env);
+	if (!cfg.elevenKey) {
+		return c.json({ state: "no_key", twins: [], action: "Add an ElevenLabs API key in Twin Setup." });
+	}
+	const vr = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": cfg.elevenKey } });
+	if (!vr.ok) {
+		return c.json({
+			state: "key_blocked",
+			detail: `HTTP ${vr.status}: ${(await vr.text()).slice(0, 200)}`,
+			twins: [],
+			action:
+				"ElevenLabs is rejecting the key (an upgrade doesn't always unblock an already-flagged key). Generate a NEW key at elevenlabs.io → API Keys and paste it into Twin Setup → Save key.",
+		});
+	}
+	const voices = ((await vr.json()) as { voices?: Array<{ voice_id: string; name: string; category?: string }> }).voices ?? [];
+	const clones = voices.filter((v) => ["cloned", "generated", "professional"].includes(v.category ?? ""));
+	const ttsOk = async (id: string, speed: number) =>
+		(
+			await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${id}?output_format=mp3_22050_32`, {
+				method: "POST",
+				headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+				body: JSON.stringify({
+					text: "test",
+					model_id: c.env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
+					voice_settings: { stability: 0.5, similarity_boost: 0.85, speed },
+				}),
+			})
+		).ok;
+
+	// Main twin: if it isn't speaking with a clone, try the preferred voice
+	// then every clone on the account, and re-attach the first that works.
+	let mainVoice = cfg.elevenVoice;
+	let mainRepaired = false;
+	if (!clones.some((v) => v.voice_id === mainVoice)) {
+		const candidates = [String(c.env.TWIN_VOICE_ID || ""), ...clones.map((v) => v.voice_id)].filter(Boolean);
+		for (const cand of candidates) {
+			if (voices.some((v) => v.voice_id === cand) && (await ttsOk(cand, cfg.voiceSpeed))) {
+				await dbSet(c.env, "eleven_voice", cand);
+				mainVoice = cand;
+				mainRepaired = true;
+				break;
+			}
+		}
+	}
+	const twins: Array<{ name: string; voiceName: string; isClone: boolean; works: boolean; repaired: boolean }> = [];
+	twins.push({
+		name: cfg.twinName,
+		voiceName: voices.find((v) => v.voice_id === mainVoice)?.name ?? (mainVoice || "none"),
+		isClone: clones.some((v) => v.voice_id === mainVoice),
+		works: mainVoice ? await ttsOk(mainVoice, cfg.voiceSpeed) : false,
+		repaired: mainRepaired,
+	});
+
+	// Profiles: verify, and re-resolve a broken voice from the seed's query.
+	let seeds: Array<{ name?: string; voiceQuery?: string }> = [];
+	try {
+		seeds = JSON.parse(String(c.env.TWIN_SEED_PROFILES || "[]"));
+	} catch {
+		// unparseable seeds just skip re-resolution
+	}
+	for (const p of await loadProfiles(c.env)) {
+		let voiceId = p.voice_id;
+		let works = voiceId ? voices.some((v) => v.voice_id === voiceId) && (await ttsOk(voiceId, p.voice_speed ?? cfg.voiceSpeed)) : false;
+		let repaired = false;
+		if (!works) {
+			const seed = seeds.find((s) => s.name?.toLowerCase() === p.name.toLowerCase());
+			if (seed?.voiceQuery) {
+				const nv = await resolveVoice(cfg, seed.voiceQuery);
+				if (nv && (await ttsOk(nv, p.voice_speed ?? cfg.voiceSpeed))) {
+					await c.env.DB.prepare("UPDATE twin_profiles SET voice_id = ?, updated_at = ? WHERE id = ?").bind(nv, Date.now(), p.id).run();
+					voiceId = nv;
+					works = true;
+					repaired = true;
+				}
+			}
+		}
+		twins.push({
+			name: p.name,
+			voiceName: voices.find((v) => v.voice_id === voiceId)?.name ?? (voiceId || "none"),
+			isClone: clones.some((v) => v.voice_id === voiceId),
+			works,
+			repaired,
+		});
+	}
+	return c.json({
+		state: "ok",
+		twins,
+		hasClone: clones.length > 0,
+		cloneNames: clones.map((v) => v.name),
+		action: clones.length
+			? ""
+			: "Your ElevenLabs account has NO cloned voice — it was likely removed when the plan lapsed. Re-create it at elevenlabs.io → Voices → Add voice → Instant clone (takes a minute with your samples), then reopen this app: it re-attaches automatically.",
+	});
+});
+
 // Full system check: pulls delivery evidence straight from Twilio and turns it
 // into plain-English findings. Also repairs any twin number whose webhooks
 // don't point at this worker.

@@ -39,6 +39,7 @@ export function Remote() {
 	});
 
 	const contactsList = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
+	const voiceStatus = useQuery({ queryKey: ["twin-voicestatus"], queryFn: api.twinVoiceStatus, retry: false, staleTime: 60_000 });
 	const [callTo, setCallTo] = useState("");
 	const [callAs, setCallAs] = useState("");
 	const [callMission, setCallMission] = useState("");
@@ -99,6 +100,36 @@ export function Remote() {
 
 	return (
 		<div className="mx-auto max-w-md p-4" style={{ paddingBottom: "calc(2.5rem + env(safe-area-inset-bottom))" }}>
+			{/* Voice status — auto-runs and self-heals on every app open */}
+			{voiceStatus.data && (voiceStatus.data.state !== "ok" || voiceStatus.data.action || voiceStatus.data.twins.some((t) => !t.isClone && t.name !== "EDI") || voiceStatus.data.twins.some((t) => !t.works || t.repaired)) && (
+				<Card className="mb-3 border border-amber-400/20">
+					<div className="text-sm font-semibold">Voice status</div>
+					{voiceStatus.data.state !== "ok" ? (
+						<div className="mt-1 rounded-lg bg-red-500/10 px-2.5 py-1.5 text-xs text-red-300">
+							{voiceStatus.data.action}
+							{voiceStatus.data.detail && <div className="mt-1 text-zinc-500">{voiceStatus.data.detail}</div>}
+						</div>
+					) : (
+						<div className="mt-1 space-y-1">
+							{voiceStatus.data.twins.map((t) => (
+								<div
+									key={t.name}
+									className={
+										"rounded-lg px-2.5 py-1.5 text-xs " +
+										(!t.works ? "bg-red-500/10 text-red-300" : t.repaired ? "bg-emerald-500/10 text-emerald-300" : "bg-white/5 text-zinc-300")
+									}
+								>
+									{t.name}: {t.voiceName} {t.isClone ? "(your clone)" : "(stock voice)"}
+									{t.repaired ? " — auto-fixed just now, call to hear it" : !t.works ? " — NOT WORKING" : ""}
+								</div>
+							))}
+							{voiceStatus.data.action && (
+								<div className="rounded-lg bg-amber-500/10 px-2.5 py-1.5 text-xs text-amber-300">{voiceStatus.data.action}</div>
+							)}
+						</div>
+					)}
+				</Card>
+			)}
 			{/* Twins */}
 			{twins.map((t) => (
 				<Card key={t.id || "main"} className="mb-3">
