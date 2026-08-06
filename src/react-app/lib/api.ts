@@ -72,8 +72,8 @@ export const api = {
 	twinVoices: () => req<{ voices: TwinVoice[] }>("/api/twin/voices"),
 	twinPersona: (body: { persona: string; twinName?: string }) =>
 		req<{ ok: true }>("/api/twin/persona", { method: "POST", body: JSON.stringify(body) }),
-	twinCall: (to: string, profileId?: string) =>
-		req<{ ok: true; to: string }>("/api/twin/call", { method: "POST", body: JSON.stringify({ to, profileId }) }),
+	twinCall: (to: string, profileId?: string, mission?: string) =>
+		req<{ ok: true; to: string }>("/api/twin/call", { method: "POST", body: JSON.stringify({ to, profileId, mission }) }),
 	twinCalls: () =>
 		req<{ calls: Array<{ id: string; from: string | null; startedAt: number; turns: Array<{ role: "user" | "assistant"; content: string }> }> }>(
 			"/api/twin/calls",

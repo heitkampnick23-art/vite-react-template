@@ -1580,14 +1580,20 @@ twin.post("/voice/incoming", async (c) => {
 		!!c.env.TWIN_NOTIFY_CELL &&
 		fwd.replace(/\D/g, "").endsWith(c.env.TWIN_NOTIFY_CELL.replace(/\D/g, "").slice(-10));
 	if (missedOwner) c.executionCtx.waitUntil(dbSet(c.env, "last_forwarded_at", String(Date.now())).catch(() => {}));
+	const callSid = params.get("CallSid") ?? "unknown";
+	// Twin-placed calls with a mission open with the pre-drafted line.
+	const missionData = await c.env.CACHE
+		.get<{ mission: string; opener: string }>(`twin:mission:${callSid}`, "json")
+		.catch(() => null);
 	// Repeat callers get greeted like the twin remembers them — because it does.
 	const mem = await getCaller(c.env, from).catch(() => null);
-	const greeting = missedOwner
-		? `Hey${mem?.name ? ` ${mem.name}` : ""}, ${cfg.twinName} can't grab the phone right now — you've got his AI twin. What's up?`
-		: mem && mem.call_count > 0
-			? `Hey${mem.name ? ` ${mem.name}` : ""}, it's ${cfg.twinName}'s AI twin again — good to hear from you. What's up?`
-			: `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
-	const callSid = params.get("CallSid") ?? "unknown";
+	const greeting = missionData?.opener
+		? missionData.opener
+		: missedOwner
+			? `Hey${mem?.name ? ` ${mem.name}` : ""}, ${cfg.twinName} can't grab the phone right now — you've got his AI twin. What's up?`
+			: mem && mem.call_count > 0
+				? `Hey${mem.name ? ` ${mem.name}` : ""}, it's ${cfg.twinName}'s AI twin again — good to hear from you. What's up?`
+				: `Hey, it's ${cfg.twinName}'s AI twin speaking on his behalf. What's up?`;
 	c.executionCtx.waitUntil(saveConvo(c.env, callSid, [{ role: "assistant", content: greeting }]));
 	c.executionCtx.waitUntil(saveTranscript(c.env, callSid, params.get("From"), [{ role: "assistant", content: greeting }]));
 	if (from) {
@@ -1653,14 +1659,18 @@ twin.post("/voice/respond", async (c) => {
 		return xml(gather(c.env, await speak(c.env, cfg, retry), retry));
 	}
 
-	// These three are independent — fetching them one after another added a
-	// round trip each to every spoken turn.
-	const [history, mem, facts] = await Promise.all([
+	// These are independent — fetching them one after another added a round
+	// trip each to every spoken turn.
+	const [history, mem, facts, missionData] = await Promise.all([
 		loadConvo(c.env, callSid),
 		getCaller(c.env, params.get("From") ?? "").catch(() => null),
 		loadFacts(c.env).catch(() => [] as Fact[]),
+		c.env.CACHE.get<{ mission: string; opener: string }>(`twin:mission:${callSid}`, "json").catch(() => null),
 	]);
 	history.push({ role: "user", content: heard });
+	const missionContext = missionData
+		? ` You placed this call on ${cfg.twinName}'s behalf with a mission: "${missionData.mission}". Pursue it politely and naturally, get the answer or deliver the message, confirm anything important, and wrap up once it's handled.`
+		: "";
 
 	// The moment a caller asks to be contacted or leaves a message, text the
 	// owner immediately (once per call) — don't wait for a formal goodbye.
@@ -1719,7 +1729,7 @@ twin.post("/voice/respond", async (c) => {
 			from: params.get("From"),
 			heard,
 			history,
-			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem),
+			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem) + missionContext,
 		}),
 	);
 	// Straight to /voice/answer — the redirect round trip itself is the only
@@ -2701,12 +2711,13 @@ twin.post(
 		z.object({
 			to: z.string().regex(/^\+\d{8,15}$/, "Use E.164 format, e.g. +15551234567"),
 			profileId: z.string().optional(),
+			mission: z.string().min(3).max(500).optional(),
 		}),
 	),
 	async (c) => {
 		let cfg = await loadCfg(c.env);
 		if (!cfg.twilioSid || !cfg.twilioToken) return c.json({ error: "twilio_not_connected" }, 400);
-		const { to, profileId } = c.req.valid("json");
+		const { to, profileId, mission } = c.req.valid("json");
 		if (profileId) {
 			const p = (await loadProfiles(c.env)).find((x) => x.id === profileId);
 			if (!p) return c.json({ error: "profile_not_found" }, 404);
@@ -2722,6 +2733,29 @@ twin.post(
 		if (!res.ok) {
 			const msg = (res.data as { message?: string }).message ?? "Twilio rejected the call.";
 			return c.json({ error: "twilio_error", message: msg }, 502);
+		}
+		// A mission shapes the whole call: draft the opening line now (the
+		// callee takes seconds to answer — plenty of time), pre-warm its audio,
+		// and stash both keyed by the call SID for the voice webhooks.
+		const callSid = String((res.data as { sid?: string }).sid ?? "");
+		if (mission && callSid) {
+			const snap = cfg;
+			c.executionCtx.waitUntil(
+				(async () => {
+					const opener =
+						(await claude(
+							c.env,
+							`You are ${snap.twinName}'s AI twin about to place a phone call on his behalf. The mission: "${mission}". ` +
+								`Write the single opening line to say the moment the person answers. Requirements: identify yourself as ${snap.twinName}'s AI twin (mandatory disclosure), then get to the reason naturally in one short casual sentence. Output ONLY the line, no quotes.`,
+							[{ role: "user", content: "Write the opening line." }],
+							100,
+						)) ?? `Hey, it's ${snap.twinName}'s AI twin calling on his behalf.`;
+					await c.env.CACHE.put(`twin:mission:${callSid}`, JSON.stringify({ mission, opener }), {
+						expirationTtl: 3600,
+					});
+					await speak(c.env, snap, opener); // clip is cached before they pick up
+				})(),
+			);
 		}
 		return c.json({ ok: true, to });
 	},

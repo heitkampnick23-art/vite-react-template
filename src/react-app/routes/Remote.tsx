@@ -41,12 +41,14 @@ export function Remote() {
 	const contactsList = useQuery({ queryKey: ["twin-contacts"], queryFn: api.twinContacts, retry: false });
 	const [callTo, setCallTo] = useState("");
 	const [callAs, setCallAs] = useState("");
+	const [callMission, setCallMission] = useState("");
 	const placeCall = useMutation({
 		mutationFn: () => {
 			const digits = callTo.replace(/\D/g, "");
 			const to = digits.length === 10 ? `+1${digits}` : `+${digits}`;
-			return api.twinCall(to, callAs || undefined);
+			return api.twinCall(to, callAs || undefined, callMission.trim() || undefined);
 		},
+		onSuccess: () => setCallMission(""),
 	});
 	const [fact, setFact] = useState("");
 	const addFact = useMutation({
@@ -140,6 +142,12 @@ export function Remote() {
 						))}
 					</select>
 				)}
+				<textarea
+					className={inputCls + " mt-2 min-h-16"}
+					placeholder={'What should it say or find out? e.g. "Ask if my part came in" or "Tell him I am running late"'}
+					value={callMission}
+					onChange={(e) => setCallMission(e.target.value)}
+				/>
 				<div className="mt-2 flex gap-2">
 					<input
 						className={inputCls}
