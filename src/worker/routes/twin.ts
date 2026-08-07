@@ -2154,7 +2154,7 @@ twin.get("/voicestatus", ownerOnly, async (c) => {
 			detail: `HTTP ${vr.status}: ${(await vr.text()).slice(0, 200)}`,
 			twins: [],
 			action:
-				"ElevenLabs is rejecting the key (an upgrade doesn't always unblock an already-flagged key). Generate a NEW key at elevenlabs.io → API Keys and paste it into Twin Setup → Save key.",
+				"ElevenLabs is rejecting the stored key. Fix: elevenlabs.io → API Keys → Create key, then copy the code starting with sk_ from the POPUP shown the moment it's created (the list afterward only shows an ID — that won't work). Paste it into Twin Setup → Save key; it only saves if ElevenLabs accepts it.",
 		});
 	}
 	const voices = ((await vr.json()) as { voices?: Array<{ voice_id: string; name: string; category?: string }> }).voices ?? [];
@@ -2710,7 +2710,13 @@ twin.post(
 		if (key) {
 			const res = await fetch("https://api.elevenlabs.io/v1/voices", { headers: { "xi-api-key": key } });
 			if (!res.ok) {
-				return c.json({ error: "elevenlabs_auth_failed", message: "ElevenLabs rejected that API key." }, 400);
+				const body = (await res.text()).slice(0, 200);
+				// The classic mistake: pasting the key ID from the list instead of
+				// the sk_ secret, which ElevenLabs shows only once at creation.
+				const message = /sk_|key id/i.test(body) || !key.startsWith("sk_")
+					? "That's the key ID from the list, not the API key. Create a NEW key at elevenlabs.io → API Keys, and copy the code starting with sk_ from the popup that appears the moment it's created — it's shown only that once."
+					: `ElevenLabs rejected that API key: ${body}`;
+				return c.json({ error: "elevenlabs_auth_failed", message }, 400);
 			}
 			await cfgSet(c, "eleven_key", key);
 			if (voiceId) await cfgSet(c, "eleven_voice", voiceId);
