@@ -1100,41 +1100,27 @@ async function a2pRegister(
 		ok: brandStatus === "APPROVED",
 		note: brandStatus + (failureReason ? ` — ${failureReason}` : ""),
 	});
-	// FAILED brands (usually an expired verification link) get refiled for a
-	// fresh OTP text — capped at two refiles since each may bill a small fee.
+	// FAILED brands: the registry allows one sole-prop brand per person, so a
+	// replacement gets "Duplicate Brand can not be saved" — the existing brand
+	// must be RESUBMITTED instead, then verified via a fresh OTP text.
 	if (brandStatus === "FAILED") {
-		const attempts = Number((await cfgGet(env, "a2p_brand_attempts")) || 0);
-		if (attempts >= 2) {
-			return {
-				steps,
-				done: false,
-				next: `Brand failed ${attempts + 1} times${failureReason ? ` (${failureReason})` : ""} — screenshot this to Claude before refiling again.`,
-			};
-		}
-		const fresh = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations`, {
-			CustomerProfileBundleSid: profileSid,
-			A2PProfileBundleSid: trustSid,
-			BrandType: "SOLE_PROPRIETOR",
+		const resubmit = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}`, {});
+		steps.push({
+			step: "Resubmit brand",
+			ok: resubmit.ok,
+			note: resubmit.ok ? "re-vetting started" : err(resubmit.data, resubmit.status),
 		});
-		const freshSid = String(fresh.data.sid ?? "");
-		if (!fresh.ok || !freshSid) {
-			steps.push({ step: "Refile brand", ok: false, note: err(fresh.data, fresh.status) });
-			return { steps, done: false, next: "Refile failed — screenshot this to Claude." };
-		}
-		await dbSet(env, "a2p_brand", freshSid);
-		await dbSet(env, "a2p_brand_attempts", String(attempts + 1));
-		steps.push({ step: "Refile brand", ok: true, note: freshSid });
-		// Creating a brand does NOT send the verification text by itself — that
-		// omission is why the owner never received one. Fire it explicitly.
-		const otp = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${freshSid}/SmsOtp`, {});
+		const otp = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}/SmsOtp`, {});
 		steps.push({ step: "Verification text", ok: otp.ok, note: otp.ok ? "sent now" : err(otp.data, otp.status) });
 		if (otp.ok) await dbSet(env, "a2p_otp_last", String(Date.now()));
 		return {
 			steps,
 			done: false,
 			next: otp.ok
-				? "Brand refiled and the verification text was JUST sent to your cell — tap the link the moment it arrives (they expire), then rerun this."
-				: "Brand refiled but the verification text failed to send — rerun this in a minute to retry it.",
+				? "Verification text JUST sent to your cell — tap the link the moment it arrives (they expire), then rerun this."
+				: resubmit.ok
+					? "Brand resubmitted — rerun this in a few minutes to send the verification text."
+					: "Both recovery calls failed — screenshot this to Claude.",
 		};
 	}
 
