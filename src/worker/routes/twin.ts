@@ -2172,12 +2172,20 @@ twin.get("/voicestatus", ownerOnly, async (c) => {
 			})
 		).ok;
 
-	// Main twin: if it isn't speaking with a clone, try the preferred voice
-	// then every clone on the account, and re-attach the first that works.
+	// Main twin: only repair when the configured voice is actually missing or
+	// won't synthesize — a working voice is the owner's choice and is left
+	// alone whatever ElevenLabs calls its category. Voices belonging to other
+	// twins are never candidates, so the main twin can't inherit EDI's robot.
+	const profileList = await loadProfiles(c.env);
+	const takenByProfiles = new Set(profileList.map((p) => p.voice_id).filter(Boolean) as string[]);
 	let mainVoice = cfg.elevenVoice;
 	let mainRepaired = false;
-	if (!clones.some((v) => v.voice_id === mainVoice)) {
-		const candidates = [String(c.env.TWIN_VOICE_ID || ""), ...clones.map((v) => v.voice_id)].filter(Boolean);
+	const mainWorks = mainVoice && voices.some((v) => v.voice_id === mainVoice) && (await ttsOk(mainVoice, cfg.voiceSpeed));
+	if (!mainWorks) {
+		const candidates = [
+			String(c.env.TWIN_VOICE_ID || ""),
+			...clones.map((v) => v.voice_id),
+		].filter((id) => id && id !== mainVoice && !takenByProfiles.has(id));
 		for (const cand of candidates) {
 			if (voices.some((v) => v.voice_id === cand) && (await ttsOk(cand, cfg.voiceSpeed))) {
 				await dbSet(c.env, "eleven_voice", cand);
@@ -2192,7 +2200,7 @@ twin.get("/voicestatus", ownerOnly, async (c) => {
 		name: cfg.twinName,
 		voiceName: voices.find((v) => v.voice_id === mainVoice)?.name ?? (mainVoice || "none"),
 		isClone: clones.some((v) => v.voice_id === mainVoice),
-		works: mainVoice ? await ttsOk(mainVoice, cfg.voiceSpeed) : false,
+		works: mainWorks || mainRepaired,
 		repaired: mainRepaired,
 	});
 
@@ -2203,7 +2211,7 @@ twin.get("/voicestatus", ownerOnly, async (c) => {
 	} catch {
 		// unparseable seeds just skip re-resolution
 	}
-	for (const p of await loadProfiles(c.env)) {
+	for (const p of profileList) {
 		let voiceId = p.voice_id;
 		let works = voiceId ? voices.some((v) => v.voice_id === voiceId) && (await ttsOk(voiceId, p.voice_speed ?? cfg.voiceSpeed)) : false;
 		let repaired = false;
