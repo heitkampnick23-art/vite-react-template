@@ -1110,17 +1110,21 @@ async function a2pRegister(
 			ok: resubmit.ok,
 			note: resubmit.ok ? "re-vetting started" : err(resubmit.data, resubmit.status),
 		});
-		const otp = await twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations/${brandSid}/SmsOtp`, {});
-		steps.push({ step: "Verification text", ok: otp.ok, note: otp.ok ? "sent now" : err(otp.data, otp.status) });
-		if (otp.ok) await dbSet(env, "a2p_otp_last", String(Date.now()));
 		return {
 			steps,
 			done: false,
-			next: otp.ok
-				? "Verification text JUST sent to your cell — tap the link the moment it arrives (they expire), then rerun this."
-				: resubmit.ok
-					? "Brand resubmitted — rerun this in a few minutes to send the verification text."
-					: "Both recovery calls failed — screenshot this to Claude.",
+			next: resubmit.ok
+				? "Re-vetting is running — nothing to do for ~15 minutes, then rerun this. It'll either send your verification text or come back approved."
+				: "Resubmit failed — screenshot this to Claude.",
+		};
+	}
+	// The OTP can only fire while the brand sits in UNVERIFIED (awaiting the
+	// owner's tap); during vetting states it errors — so gate it.
+	if (brandStatus !== "APPROVED" && brandStatus !== "UNVERIFIED") {
+		return {
+			steps,
+			done: false,
+			next: `Brand is ${brandStatus} — the registry is processing it. Nothing to do; rerun this in ~15 minutes.`,
 		};
 	}
 
