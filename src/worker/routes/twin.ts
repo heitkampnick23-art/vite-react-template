@@ -1528,11 +1528,13 @@ function escapeXml(s: string) {
 
 const SAY = '<Say voice="Polly.Matthew">'; // fallback voice until ElevenLabs is configured
 
-// The listening tail every answer ends with: gather speech, nudge once, hang up.
-function gatherTail(env: Env) {
+// The listening tail every answer ends with. Audio nested INSIDE the Gather is
+// barge-in-able: the caller can start talking over the twin and playback stops
+// immediately — no waiting for it to finish.
+function gatherTail(env: Env, inner = "") {
 	const action = `${env.APP_URL}/api/twin/voice/respond`;
 	return (
-		`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
+		`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true">${inner}</Gather>` +
 		`${SAY}Are you still there?</Say>` +
 		`<Gather input="speech" action="${action}" method="POST" speechTimeout="1" speechModel="experimental_conversations" language="en-US" actionOnEmptyResult="true"/>` +
 		`<Hangup/>`
@@ -1541,7 +1543,7 @@ function gatherTail(env: Env) {
 
 function gather(env: Env, playUrl: string | null, fallbackText: string) {
 	const speech = playUrl ? `<Play>${escapeXml(playUrl)}</Play>` : `${SAY}${escapeXml(fallbackText)}</Say>`;
-	return speech + gatherTail(env);
+	return gatherTail(env, speech);
 }
 
 // ==============================================================================
@@ -1846,11 +1848,13 @@ twin.post("/voice/answer", async (c) => {
 			const a = JSON.parse(row.payload) as AnswerPayload;
 			if (a.clips.length > seg) {
 				const play = `<Play>${escapeXml(a.clips[seg])}</Play>`;
+				const bargeable = (clip: string) =>
+					`<Gather input="speech" action="${c.env.APP_URL}/api/twin/voice/respond" method="POST" timeout="1" speechTimeout="1" speechModel="experimental_conversations" language="en-US">${clip}</Gather>`;
 				if (a.done && seg === a.clips.length - 1) {
 					cleanup();
-					return xml(a.hangup ? `${play}<Hangup/>` : play + gatherTail(c.env));
+					return xml(a.hangup ? `${play}<Hangup/>` : gatherTail(c.env, play));
 				}
-				return xml(`${play}<Redirect method="POST">${escapeXml(next(round, seg + 1))}</Redirect>`);
+				return xml(`${bargeable(play)}<Redirect method="POST">${escapeXml(next(round, seg + 1))}</Redirect>`);
 			}
 			if (a.done) {
 				cleanup();
