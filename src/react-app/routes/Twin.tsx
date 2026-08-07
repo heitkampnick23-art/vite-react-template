@@ -335,6 +335,12 @@ export function Twin() {
 							{saveVoiceKey.isPending ? "Checking…" : "Save key"}
 						</Button>
 					</div>
+					{voiceKey.trim() && !voiceKey.trim().startsWith("sk_") && (
+						<div className="text-xs text-amber-400">
+							Heads up: real ElevenLabs API keys start with <code>sk_</code> and are only shown in the popup right
+							when you create one — the IDs in the key list won't work.
+						</div>
+					)}
 					{saveVoiceKey.isError && <div className="text-xs text-red-400">{errMsg(saveVoiceKey.error)}</div>}
 					{s.voice.hasKey && !voices && (
 						<Button size="sm" variant="outline" className="self-start" disabled={loadVoices.isPending} onClick={() => loadVoices.mutate()}>
