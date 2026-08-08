@@ -1689,6 +1689,14 @@ twin.post("/voice/respond", async (c) => {
 		c.env.CACHE.get<{ mission: string; opener: string }>(`twin:mission:${callSid}`, "json").catch(() => null),
 	]);
 	history.push({ role: "user", content: heard });
+	// Calling from the owner's own phone: say so plainly rather than pretending
+	// a transfer is possible.
+	const callerIsOwner =
+		!!c.env.TWIN_NOTIFY_CELL &&
+		(params.get("From") ?? "").replace(/\D/g, "").endsWith(c.env.TWIN_NOTIFY_CELL.replace(/\D/g, "").slice(-10));
+	const selfTransferNote = callerIsOwner
+		? ` The person on this call is ${cfg.twinName} himself, calling from his own phone. If he asks to be transferred to himself, tell him plainly that he IS the number you'd dial — to test a transfer he needs to call from a different phone.`
+		: "";
 	const missionContext = missionData
 		? ` You placed this call on ${cfg.twinName}'s behalf with a mission: "${missionData.mission}". Pursue it politely and naturally, get the answer or deliver the message, confirm anything important, and wrap up once it's handled.`
 		: "";
@@ -1712,8 +1720,11 @@ twin.post("/voice/respond", async (c) => {
 
 	// Escape hatch: caller urgently needs the real owner — bridge the call to
 	// their cell (caller sees the twin's number so they know it's a transfer).
+	// Never when the caller IS that cell: dialing it would ring a line already
+	// busy on this very call, which looks exactly like "transfers don't work".
 	if (
 		c.env.TWIN_NOTIFY_CELL &&
+		!callerIsOwner &&
 		/(real (nick|person|human|one|him)|speak (to|with) (nick|him)|talk (to|with) (nick|him)|is nick (there|around|available|in)|put (him|nick) on|get (him|nick)( on| for me)?\b|where('| i)s nick|reach (him|nick)|transfer|connect me|a (human|person|real person)|urgent|emergency|right away)/i.test(
 			heard,
 		)
@@ -1750,7 +1761,7 @@ twin.post("/voice/respond", async (c) => {
 			from: params.get("From"),
 			heard,
 			history,
-			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem) + missionContext,
+			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem) + missionContext + selfTransferNote,
 		}),
 	);
 	// Hold the webhook open briefly: most first sentences are voiced within
