@@ -1299,7 +1299,7 @@ async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | nul
 		// eleven_flash_v2_5 is ElevenLabs' low-latency model (~75ms vs turbo's
 		// ~250ms+); optimize_streaming_latency trades a little prosody for a
 		// faster first byte. Both are the right call on an 8kHz phone line.
-		`https://api.elevenlabs.io/v1/text-to-speech/${cfg.elevenVoice}?output_format=mp3_22050_32&optimize_streaming_latency=3`,
+		`https://api.elevenlabs.io/v1/text-to-speech/${cfg.elevenVoice}?output_format=mp3_22050_32&optimize_streaming_latency=4`,
 		{
 			method: "POST",
 			headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
@@ -1366,9 +1366,9 @@ async function claudeStream(
 				// partial JSON across chunks lands in buf next round
 			}
 		}
-		if (!firstFired && text.length >= 20) {
-			// A sentence boundary at least 15 chars in, followed by whitespace.
-			const m = text.match(/^[\s\S]{15,}?[.!?]["')\]]*(?=\s)/);
+		if (!firstFired && text.length >= 8) {
+			// Any complete sentence, however short, followed by whitespace.
+			const m = text.match(/^[\s\S]{4,}?[.!?]["')\]]*(?=\s)/);
 			if (m) firstFired = onFirstSentence(m[0].trim()).catch(() => {});
 		}
 	}
@@ -1395,7 +1395,9 @@ function callSystem(cfg: TwinCfg, extraContext: string) {
 	return (
 		cfg.persona +
 		extraContext +
-		" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. If the caller says goodbye, say a warm goodbye."
+		" You are on a live phone call, so answer in 1-3 short conversational sentences — never lists, never markdown. " +
+		"Open with a very short first sentence (2-6 words) — a natural reaction, acknowledgement, or the direct answer — then continue if there's more to say. " +
+		"Talk like a real person on the phone: contractions, no corporate phrasing, no restating the question. If the caller says goodbye, say a warm goodbye."
 	);
 }
 
@@ -1715,10 +1717,10 @@ twin.post("/voice/respond", async (c) => {
 			extraContext: factsBlock(cfg.twinName, facts) + callerContext(mem) + missionContext,
 		}),
 	);
-	// Straight to /voice/answer — the redirect round trip itself is the only
-	// gap. Fillers only play when the answer genuinely isn't ready yet.
-	const answerUrl = `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}`;
-	return xml(`<Redirect method="POST">${escapeXml(answerUrl)}</Redirect>`);
+	// Hold the webhook open briefly: most first sentences are voiced within
+	// about a second, and answering inline saves a whole Twilio round trip.
+	// If it's slower, this falls through to a redirect as before.
+	return await serveAnswer(c, cfg, ticket, 0, 0, 6);
 });
 
 // Spoken only when a turn is genuinely slow, rotated so it never becomes the
@@ -1808,18 +1810,33 @@ twin.post("/voice/answer", async (c) => {
 		return c.text("unauthorized", 401);
 	}
 	cfg = await overlayProfile(c.env, cfg, [params.get("To"), params.get("From")]);
-	const ticket = c.req.query("t") ?? "";
-	const round = Number(c.req.query("n") ?? 0);
-	const seg = Number(c.req.query("i") ?? 0);
+	const served = await serveAnswer(c, cfg, c.req.query("t") ?? "", Number(c.req.query("n") ?? 0), Number(c.req.query("i") ?? 0));
+	return served;
+});
+
+// Waits (in short beats) for the requested answer segment and returns the
+// TwiML that plays it. Shared by /voice/answer and by /voice/respond, which
+// calls it with a brief budget so a fast reply is delivered inline instead of
+// costing an extra Twilio round trip.
+async function serveAnswer(
+	c: Context<AppEnv>,
+	cfg: TwinCfg,
+	ticket: string,
+	round: number,
+	seg: number,
+	beatsOverride?: number,
+): Promise<Response> {
 	const next = (n: number, i: number) => `${c.env.APP_URL}/api/twin/voice/answer?t=${ticket}&n=${n}&i=${i}`;
 	const cleanup = () =>
 		c.executionCtx.waitUntil(
 			c.env.DB.prepare("DELETE FROM twin_answers WHERE id = ?").bind(ticket).run().then(() => undefined),
 		);
+	const bargeable = (clip: string) =>
+		`<Gather input="speech" action="${c.env.APP_URL}/api/twin/voice/respond" method="POST" timeout="1" speechTimeout="1" speechModel="experimental_conversations" language="en-US">${clip}</Gather>`;
 
-	// First visit polls briefly (the first sentence usually lands fast);
-	// follow-ups wait longer before conceding another filler/pause.
-	const beats = round === 0 && seg === 0 ? 4 : 8;
+	// 250ms beats: fine-grained enough that a ready clip goes out almost the
+	// moment it exists, instead of waiting out a long tick.
+	const beats = beatsOverride ?? (round === 0 && seg === 0 ? 10 : 20);
 	for (let k = 0; k < beats; k++) {
 		const row = await c.env.DB
 			.prepare("SELECT payload FROM twin_answers WHERE id = ?")
@@ -1829,8 +1846,6 @@ twin.post("/voice/answer", async (c) => {
 			const a = JSON.parse(row.payload) as AnswerPayload;
 			if (a.clips.length > seg) {
 				const play = `<Play>${escapeXml(a.clips[seg])}</Play>`;
-				const bargeable = (clip: string) =>
-					`<Gather input="speech" action="${c.env.APP_URL}/api/twin/voice/respond" method="POST" timeout="1" speechTimeout="1" speechModel="experimental_conversations" language="en-US">${clip}</Gather>`;
 				if (a.done && seg === a.clips.length - 1) {
 					cleanup();
 					return xml(a.hangup ? `${play}<Hangup/>` : gatherTail(c.env, play));
@@ -1843,14 +1858,16 @@ twin.post("/voice/answer", async (c) => {
 				return xml(a.hangup ? `${SAY}${escapeXml(a.text)}</Say><Hangup/>` : gather(c.env, null, a.text));
 			}
 		}
-		await new Promise((r) => setTimeout(r, 600));
+		await new Promise((r) => setTimeout(r, 250));
 	}
+	// Inline attempt from /voice/respond gave up: hand off to /voice/answer.
+	if (beatsOverride) return xml(`<Redirect method="POST">${escapeXml(next(round, seg))}</Redirect>`);
 	if (round >= 3) return xml(gather(c.env, null, "Sorry, that took me too long. Say that again?"));
 	// Not ready: one spoken filler the first time, silence after that.
 	const filler = round === 0 ? await speak(c.env, cfg, pickFiller(ticket)) : null;
 	const wait = filler ? `<Play>${escapeXml(filler)}</Play>` : '<Pause length="1"/>';
 	return xml(`${wait}<Redirect method="POST">${escapeXml(next(round + 1, seg))}</Redirect>`);
-});
+}
 
 // ==============================================================================
 // Setup + control endpoints (site session, owner only)
