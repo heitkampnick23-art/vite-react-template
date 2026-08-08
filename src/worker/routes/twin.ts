@@ -324,32 +324,23 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 		if (res.ok) {
 			const data = (await res.json()) as { voices?: Array<{ voice_id: string; category?: string }> };
 			const voices = data.voices ?? [];
-			// Prefer the user's own cloned voice — but only if the ElevenLabs plan
-			// can actually synthesize with it (free plan rejects cloned voices with
-			// 401 subscription_required). Otherwise fall back to a natural premade
-			// voice, and auto-switch back to the clone once the plan allows it.
-			const ttsWorks = async (voiceId: string) => {
-				const t = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_22050_32`, {
-					method: "POST",
-					headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
-					body: JSON.stringify({ text: "hi", model_id: "eleven_turbo_v2_5" }),
-				});
-				return t.ok;
-			};
-			const preferred = String(env.TWIN_VOICE_ID || "");
-			const mine = voices.find((x) => x.category === "cloned") ?? voices.find((x) => x.category === "generated");
-			let desired: string | undefined;
-			if (preferred && (await ttsWorks(preferred))) {
-				desired = preferred;
-			} else if (mine && (await ttsWorks(mine.voice_id))) {
-				desired = mine.voice_id;
-			} else if (!cfg.elevenVoice || cfg.elevenVoice === mine?.voice_id || !(await ttsWorks(cfg.elevenVoice))) {
-				// "Chris — charming, down-to-earth" premade; any premade otherwise.
+			// Pick a voice ONLY when none is configured yet. A configured voice is
+			// the owner's decision and is never overwritten here: this used to
+			// "helpfully" downgrade a clone to a premade voice whenever a test
+			// synthesis failed, so a transient key/plan problem permanently
+			// replaced the owner's own voice. Synthesis failures already fall back
+			// to <Say> at call time, which is the right place to degrade.
+			if (!cfg.elevenVoice) {
+				const preferred = String(env.TWIN_VOICE_ID || "");
+				const mine = voices.find((x) => x.category === "cloned") ?? voices.find((x) => x.category === "generated");
 				const premade =
 					voices.find((x) => x.voice_id === "iP95p4xoKVk53GoZ742B") ?? voices.find((x) => x.category === "premade");
-				desired = premade?.voice_id;
+				const desired =
+					(preferred && voices.some((v) => v.voice_id === preferred) ? preferred : "") ||
+					mine?.voice_id ||
+					premade?.voice_id;
+				if (desired) await dbSet(env, "eleven_voice", desired);
 			}
-			if (desired && desired !== cfg.elevenVoice) await dbSet(env, "eleven_voice", desired);
 		}
 	}
 	if (cfg.twilioSid && cfg.twilioToken) {
