@@ -1324,33 +1324,15 @@ async function clipId(voice: string, speed: number, text: string) {
 async function speak(env: Env, cfg: TwinCfg, text: string): Promise<string | null> {
 	if (!cfg.elevenKey || !cfg.elevenVoice) return null;
 	const id = await clipId(cfg.elevenVoice, cfg.voiceSpeed, text);
-	const url = `${env.APP_URL}/api/twin/voice/audio/${id}`;
-	// Already synthesized recently? Skip ElevenLabs entirely.
-	if (await env.CACHE.get(`twin:audio:${id}`, "stream")) return url;
-	const res = await fetch(
-		// eleven_flash_v2_5 is ElevenLabs' low-latency model (~75ms vs turbo's
-		// ~250ms+); optimize_streaming_latency trades a little prosody for a
-		// faster first byte. Both are the right call on an 8kHz phone line.
-		`https://api.elevenlabs.io/v1/text-to-speech/${cfg.elevenVoice}?output_format=mp3_22050_32&optimize_streaming_latency=4`,
-		{
-			method: "POST",
-			headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
-			body: JSON.stringify({
-				text,
-				model_id: env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
-				voice_settings: {
-					stability: 0.5,
-					similarity_boost: 0.85,
-					// Per-twin speed; default slightly faster than natural
-					// (ElevenLabs range 0.7–1.2).
-					speed: cfg.voiceSpeed,
-				},
-			}),
-		},
+	// Store only the SPEC. Synthesis happens when Twilio fetches the clip and
+	// is streamed straight through, so nothing on the caller's clock waits for
+	// a full mp3 to be generated, uploaded to KV and downloaded again.
+	await env.CACHE.put(
+		`twin:clip:${id}`,
+		JSON.stringify({ text, voice: cfg.elevenVoice, speed: cfg.voiceSpeed }),
+		{ expirationTtl: AUDIO_TTL },
 	);
-	if (!res.ok) return null;
-	await env.CACHE.put(`twin:audio:${id}`, await res.arrayBuffer(), { expirationTtl: AUDIO_TTL });
-	return url;
+	return `${env.APP_URL}/api/twin/voice/audio/${id}`;
 }
 
 // --- Claude persona reply ------------------------------------------------------
@@ -1566,9 +1548,31 @@ function gather(env: Env, playUrl: string | null, fallbackText: string) {
 // ==============================================================================
 
 twin.get("/voice/audio/:id", async (c) => {
-	const buf = await c.env.CACHE.get(`twin:audio:${c.req.param("id")}`, "arrayBuffer");
-	if (!buf) return c.text("gone", 404);
-	return new Response(buf, { headers: { "content-type": "audio/mpeg" } });
+	const id = c.req.param("id");
+	const spec = await c.env.CACHE.get<{ text: string; voice: string; speed: number }>(`twin:clip:${id}`, "json");
+	if (!spec) return c.text("gone", 404);
+	// The key is read here rather than stored alongside the clip.
+	const { elevenKey } = await loadCfg(c.env);
+	if (!elevenKey) return c.text("no key", 502);
+	// eleven_flash_v2_5 is ElevenLabs' low-latency model (~75ms vs turbo's
+	// ~250ms+) and /stream with optimize_streaming_latency=4 starts returning
+	// audio almost immediately — Twilio plays it as it arrives.
+	const res = await fetch(
+		`https://api.elevenlabs.io/v1/text-to-speech/${spec.voice}/stream?output_format=mp3_22050_32&optimize_streaming_latency=4`,
+		{
+			method: "POST",
+			headers: { "xi-api-key": elevenKey, "content-type": "application/json" },
+			body: JSON.stringify({
+				text: spec.text,
+				model_id: c.env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
+				voice_settings: { stability: 0.5, similarity_boost: 0.85, speed: spec.speed },
+			}),
+		},
+	);
+	// On failure Twilio skips the <Play> and moves on to the Gather rather
+	// than dropping the call.
+	if (!res.ok || !res.body) return c.text("tts failed", 502);
+	return new Response(res.body, { headers: { "content-type": "audio/mpeg", "cache-control": "no-store" } });
 });
 
 // Required by FCC rules for AI-generated voice calls: the twin must identify
@@ -2149,8 +2153,11 @@ twin.get("/forwarding", ownerOnly, async (c) => {
 		carriers: [
 			{
 				carrier: "AT&T, T-Mobile & most GSM carriers",
-				activate: [{ label: "When you don't answer (recommended)", code: `**61*${digits}#` }],
-				deactivate: "##004#",
+				activate: [
+					{ label: "After 25s of ringing (recommended)", code: `**61*${digits}**25#` },
+					{ label: "When you don't answer (default ring time)", code: `**61*${digits}#` },
+				],
+				deactivate: "##002#",
 			},
 			{
 				carrier: "AT&T / T-Mobile — also forward these",
@@ -2171,7 +2178,8 @@ twin.get("/forwarding", ownerOnly, async (c) => {
 			"Dial the code from your personal phone (the one being forwarded), then press call — the carrier confirms with a tone or banner.",
 			"Only unanswered/busy calls forward; calls you pick up are untouched.",
 			'Use the "don\'t answer" code. The catch-all **004* also forwards when your phone is unreachable, which sends the twin\'s own transfer call back to the twin — so callers asking for the real you never get through.',
-			"Switching codes? Dial the off code first (##004# or *73), then the new one.",
+			"Switching codes? Dial the off code first (##002# clears every forward on GSM, *73 on Verizon), then the new one.",
+			"Phone never rings and calls go straight to the twin? An UNCONDITIONAL forward is active (**21*/*72). Dial ##002# to clear it, then set the after-25-seconds code above.",
 			"Test it: have someone call your personal number and don't answer — your twin should pick up.",
 			"Forwarded minutes may bill against your carrier plan.",
 		],
