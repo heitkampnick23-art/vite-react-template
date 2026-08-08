@@ -1074,6 +1074,38 @@ async function a2pRegister(
 		steps.push({ step: "Submit trust product", ok: true, note: "submitted" });
 	} else steps.push({ step: "Submit trust product", ok: true, note: "already done" });
 
+	// A brand can only pass once BOTH bundles are twilio-approved. When one is
+	// still in review — or was rejected — the brand fails with a generic
+	// "General Error", so surface the real state (and the rejection reasons)
+	// instead of resubmitting into a wall forever.
+	const bundleState = async (kind: "CustomerProfiles" | "TrustProducts", sid: string, label: string) => {
+		const b = await twilioForm(S, T, `${TRUSTHUB}/${kind}/${sid}`);
+		const st = String((b.data as { status?: string }).status ?? "unknown");
+		if (st === "twilio-approved") {
+			steps.push({ step: label, ok: true, note: "approved" });
+			return true;
+		}
+		let why = "";
+		if (st === "twilio-rejected") {
+			const evals = await twilioForm(S, T, `${TRUSTHUB}/${kind}/${sid}/Evaluations?PageSize=1`);
+			const results = (evals.data as { results?: Array<{ results?: Array<{ friendly_name?: string; passed?: boolean; failure_reason?: string }> }> }).results ?? [];
+			const failed = (results[0]?.results ?? []).filter((r) => r.passed === false);
+			why = failed.map((r) => `${r.friendly_name ?? "check"}: ${r.failure_reason ?? "failed"}`).join("; ").slice(0, 300);
+		}
+		steps.push({ step: label, ok: false, note: st + (why ? ` — ${why}` : "") });
+		return false;
+	};
+	const profileOk = await bundleState("CustomerProfiles", profileSid, "Profile approval");
+	const trustOk = await bundleState("TrustProducts", trustSid, "Trust product approval");
+	if (!profileOk || !trustOk) {
+		return {
+			steps,
+			done: false,
+			next:
+				"The brand can't pass until both bundles above are approved by Twilio. If either says 'in-review' or 'pending-review', that's just waiting — rerun this later. If either says 'twilio-rejected', the note explains what Twilio objected to; send it to Claude and we'll correct and resubmit.",
+		};
+	}
+
 	// 4. Brand registration — this is what texts the owner the OTP link.
 	const brandSid = await ensure("a2p_brand", "Brand registration", () =>
 		twilioForm(S, T, `${MESSAGING}/a2p/BrandRegistrations`, {
