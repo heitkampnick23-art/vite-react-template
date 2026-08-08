@@ -324,32 +324,23 @@ export async function twinAutoFinish(env: Env): Promise<string> {
 		if (res.ok) {
 			const data = (await res.json()) as { voices?: Array<{ voice_id: string; category?: string }> };
 			const voices = data.voices ?? [];
-			// Prefer the user's own cloned voice — but only if the ElevenLabs plan
-			// can actually synthesize with it (free plan rejects cloned voices with
-			// 401 subscription_required). Otherwise fall back to a natural premade
-			// voice, and auto-switch back to the clone once the plan allows it.
-			const ttsWorks = async (voiceId: string) => {
-				const t = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_22050_32`, {
-					method: "POST",
-					headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
-					body: JSON.stringify({ text: "hi", model_id: "eleven_turbo_v2_5" }),
-				});
-				return t.ok;
-			};
-			const preferred = String(env.TWIN_VOICE_ID || "");
-			const mine = voices.find((x) => x.category === "cloned") ?? voices.find((x) => x.category === "generated");
-			let desired: string | undefined;
-			if (preferred && (await ttsWorks(preferred))) {
-				desired = preferred;
-			} else if (mine && (await ttsWorks(mine.voice_id))) {
-				desired = mine.voice_id;
-			} else if (!cfg.elevenVoice || cfg.elevenVoice === mine?.voice_id || !(await ttsWorks(cfg.elevenVoice))) {
-				// "Chris — charming, down-to-earth" premade; any premade otherwise.
+			// Pick a voice ONLY when none is configured yet. A configured voice is
+			// the owner's decision and is never overwritten here: this used to
+			// "helpfully" downgrade a clone to a premade voice whenever a test
+			// synthesis failed, so a transient key/plan problem permanently
+			// replaced the owner's own voice. Synthesis failures already fall back
+			// to <Say> at call time, which is the right place to degrade.
+			if (!cfg.elevenVoice) {
+				const preferred = String(env.TWIN_VOICE_ID || "");
+				const mine = voices.find((x) => x.category === "cloned") ?? voices.find((x) => x.category === "generated");
 				const premade =
 					voices.find((x) => x.voice_id === "iP95p4xoKVk53GoZ742B") ?? voices.find((x) => x.category === "premade");
-				desired = premade?.voice_id;
+				const desired =
+					(preferred && voices.some((v) => v.voice_id === preferred) ? preferred : "") ||
+					mine?.voice_id ||
+					premade?.voice_id;
+				if (desired) await dbSet(env, "eleven_voice", desired);
 			}
-			if (desired && desired !== cfg.elevenVoice) await dbSet(env, "eleven_voice", desired);
 		}
 	}
 	if (cfg.twilioSid && cfg.twilioToken) {
@@ -2159,18 +2150,21 @@ twin.get("/voicestatus", ownerOnly, async (c) => {
 	}
 	const voices = ((await vr.json()) as { voices?: Array<{ voice_id: string; name: string; category?: string }> }).voices ?? [];
 	const clones = voices.filter((v) => ["cloned", "generated", "professional"].includes(v.category ?? ""));
-	const ttsOk = async (id: string, speed: number) =>
-		(
-			await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${id}?output_format=mp3_22050_32`, {
-				method: "POST",
-				headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
-				body: JSON.stringify({
-					text: "test",
-					model_id: c.env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
-					voice_settings: { stability: 0.5, similarity_boost: 0.85, speed },
-				}),
-			})
-		).ok;
+	// Records why synthesis failed so the panel can name the real fix.
+	let ttsFailure = "";
+	const ttsOk = async (id: string, speed: number) => {
+		const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${id}?output_format=mp3_22050_32`, {
+			method: "POST",
+			headers: { "xi-api-key": cfg.elevenKey, "content-type": "application/json" },
+			body: JSON.stringify({
+				text: "test",
+				model_id: c.env.TWIN_TTS_MODEL || "eleven_flash_v2_5",
+				voice_settings: { stability: 0.5, similarity_boost: 0.85, speed },
+			}),
+		});
+		if (!r.ok && !ttsFailure) ttsFailure = (await r.text()).slice(0, 200);
+		return r.ok;
+	};
 
 	// Main twin: only repair when the configured voice is actually missing or
 	// won't synthesize — a working voice is the owner's choice and is left
@@ -2235,14 +2229,21 @@ twin.get("/voicestatus", ownerOnly, async (c) => {
 			repaired,
 		});
 	}
+	// A key that lists voices but can't speak is the commonest trap: the key
+	// was created without the Text to Speech permission.
+	const permissionProblem = /missing_permissions|missing the permission/i.test(ttsFailure);
 	return c.json({
 		state: "ok",
 		twins,
 		hasClone: clones.length > 0,
 		cloneNames: clones.map((v) => v.name),
-		action: clones.length
-			? ""
-			: "Your ElevenLabs account has NO cloned voice — it was likely removed when the plan lapsed. Re-create it at elevenlabs.io → Voices → Add voice → Instant clone (takes a minute with your samples), then reopen this app: it re-attaches automatically.",
+		action: permissionProblem
+			? "Your ElevenLabs key can read voices but isn't allowed to speak — it was created without the Text to Speech permission. Fix without a new key: elevenlabs.io → API Keys → the ⋯ menu on your key → Edit → tick Text to Speech (or 'Access to all') → Save. Then reopen this app."
+			: ttsFailure
+				? `Synthesis is failing: ${ttsFailure}`
+				: clones.length
+					? ""
+					: "Your ElevenLabs account has NO cloned voice — it was likely removed when the plan lapsed. Re-create it at elevenlabs.io → Voices → Add voice → Instant clone (takes a minute with your samples), then reopen this app: it re-attaches automatically.",
 	});
 });
 
@@ -2316,10 +2317,12 @@ twin.get("/syscheck", ownerOnly, async (c) => {
 	// live TTS test per twin, so "the clone voice stopped working" gets a
 	// concrete reason instead of a mystery.
 	const explainEleven = (status: number, body: string): string => {
+		if (/missing_permissions|missing the permission/i.test(body))
+			return " → the key exists but wasn't granted the Text to Speech permission. Fix (no new key needed): elevenlabs.io → API Keys → the … menu on this key → Edit → enable Text to Speech (or 'Access to all') → Save.";
 		if (/unusual.?activity|free.?tier.*(disabled|abuse)/i.test(body))
 			return " → ElevenLabs disables FREE-tier API keys used from cloud servers. Fix: upgrade ElevenLabs to Starter (~$5/mo) at elevenlabs.io, or paste a key from a paid account in Twin Setup.";
 		if (/quota|character.*limit|exceeds/i.test(body)) return " → your ElevenLabs monthly character quota is used up — upgrade the plan or wait for the reset.";
-		if (status === 401) return " → the key is invalid or revoked — paste a fresh key in Twin Setup.";
+		if (status === 401) return " → the key is invalid, revoked, or lacks this permission — check it at elevenlabs.io → API Keys.";
 		if (/voice.*not.*found|does not exist/i.test(body)) return " → that voice is no longer on your ElevenLabs account — pick a new one in Twin Setup.";
 		return "";
 	};
